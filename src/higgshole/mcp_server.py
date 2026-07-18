@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -525,3 +526,96 @@ TOOL_HANDLERS: dict[str, Any] = {
     "generate_video": tool_generate_video,
     "get_job": tool_get_job,
 }
+
+
+async def tool_upload_asset(
+    api: HiggsHoleAPI, *, path: str, project: str = "unsorted"
+) -> dict[str, Any]:
+    """Ingest a local file so it can be used as a reference.
+
+    Closes the ingress gap of spec section 6.2: without it an agent holding a
+    local image has no way to feed it into a generation. The file is read here
+    and posted as multipart; the API owns where it lands on disk.
+    """
+    source = Path(path).expanduser()
+    if not source.is_file():
+        raise ToolError("asset_not_found", f"no readable file at {source}")
+
+    files = {
+        "file": (source.name, source.read_bytes(), "application/octet-stream"),
+        # A (None, value) tuple is httpx's spelling for a plain multipart form
+        # field, which is what FastAPI's Form(...) parameter expects.
+        "project": (None, project),
+    }
+    payload = await api.request("POST", "/api/uploads", files=files)
+    return with_local_path(payload, api.base_url)
+
+
+async def tool_list_media(
+    api: HiggsHoleAPI,
+    *,
+    project: str | None = None,
+    kind: str | None = None,
+    model: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    payload = await api.request(
+        "GET",
+        "/api/media",
+        params={
+            "project": project,
+            "kind": kind,
+            "model": model,
+            "created_after": created_after,
+            "created_before": created_before,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+    items = [_with_asset_urls(item, api.base_url) for item in payload.get("items", [])]
+    return {**payload, "items": items}
+
+
+async def tool_get_media(api: HiggsHoleAPI, *, generation_id: str) -> dict[str, Any]:
+    payload = await api.request("GET", f"/api/media/{generation_id}")
+    return _with_asset_urls(payload, api.base_url)
+
+
+async def tool_delete_media(api: HiggsHoleAPI, *, generation_id: str) -> dict[str, Any]:
+    """Delete a generation, its files and its thumbnails.
+
+    The API answers 204 with no body, so an explicit confirmation object is
+    synthesised: an agent receiving ``{}`` cannot tell success from a no-op.
+    """
+    await api.request("DELETE", f"/api/media/{generation_id}")
+    return {"deleted": True, "generation_id": generation_id}
+
+
+async def tool_list_projects(api: HiggsHoleAPI) -> list[dict[str, Any]]:
+    payload = await api.request("GET", "/api/projects")
+    return list(payload.get("items", []))
+
+
+async def tool_create_project(api: HiggsHoleAPI, *, name: str) -> dict[str, Any]:
+    return await api.request("POST", "/api/projects", json_body={"name": name})
+
+
+async def tool_get_budget(api: HiggsHoleAPI) -> dict[str, Any]:
+    """Provider-authoritative credit plus local cap status (spec section 3.2)."""
+    return await api.request("GET", "/api/budget")
+
+
+TOOL_HANDLERS.update(
+    {
+        "upload_asset": tool_upload_asset,
+        "list_media": tool_list_media,
+        "get_media": tool_get_media,
+        "delete_media": tool_delete_media,
+        "list_projects": tool_list_projects,
+        "create_project": tool_create_project,
+        "get_budget": tool_get_budget,
+    }
+)
