@@ -4,7 +4,8 @@ A self-hosted AI image and video generation console with a browsable media
 library, backed by the [OpenRouter](https://openrouter.ai) API and exposed to
 local AI agents over MCP.
 
-> **Status:** design complete, implementation not yet started.
+> **Status:** implemented. Web UI, REST API, MCP server and systemd unit are in
+> place and covered by an offline test suite.
 > See [the design specification](docs/specs/2026-07-18-higgshole-design.md).
 
 ## What it does
@@ -27,6 +28,43 @@ local AI agents over MCP.
 - No prompt rewriting — prompts are passed to the provider verbatim
 - No authentication — intended for a trusted LAN
 - No multi-user support
+- No batch generation — `n` is fixed at 1 so every generation has its own cost
+  record
+
+## Quick start
+
+```bash
+uv sync
+uv run pytest -q          # the whole suite, offline and free
+uv run higgshole          # serves http://127.0.0.1:8077
+```
+
+The suite makes no network requests and costs nothing: a socket-blocking
+fixture enforces that rather than trusting convention. The single billable test
+is opt-in behind `HIGGSHOLE_LIVE_TESTS` and skipped by default.
+
+## MCP tools
+
+Eleven tools, each a thin translation of one REST call — see
+[docs/mcp.md](docs/mcp.md) for client registration:
+
+| Tool | Behaviour |
+|---|---|
+| `list_models` | Image and video models with capability constraints |
+| `generate_image` | Synchronous; returns the finished asset |
+| `generate_video` | Returns a job ID immediately — does not block |
+| `get_job` | Status, with optional bounded long-polling |
+| `upload_asset` | Ingests a local file, returning a reusable asset ID |
+| `list_media` | Browse with filters |
+| `get_media` | Full metadata for one item, including lineage |
+| `delete_media` | Removes a generation, its files and its thumbnails |
+| `list_projects` | Enumerate projects |
+| `create_project` | Create a project |
+| `get_budget` | Provider-authoritative credit plus local cap status |
+
+Every asset-returning tool provides both the local filesystem path and the HTTP
+URL, since agents run on the same host. Costs are strings or `null` — never `0`
+to represent an unknown cost.
 
 ## Design notes
 
@@ -43,14 +81,16 @@ specification rather than the prose docs, which contradict it in places.
 - An OpenRouter API key
 
 Runs anywhere Python and ffmpeg run. A systemd unit is provided for boot-time
-startup on Linux, but nothing in the architecture depends on it.
+startup on Linux — see [docs/deployment.md](docs/deployment.md) — but nothing
+in the architecture depends on it.
 
 ## Configuration
 
 Everything is configured through environment variables, readable from a `.env`
 file — see [`.env.example`](.env.example) for the full list with defaults. By
-default the app writes to `~/.local/share/higgshole` and `~/.local/state/higgshole`
-and binds to `127.0.0.1`, so a fresh clone runs unprivileged with no setup.
+default the app writes under `${XDG_DATA_HOME:-~/.local/share}/higgshole` and
+`${XDG_STATE_HOME:-~/.local/state}/higgshole` and binds to `127.0.0.1`, so a
+fresh clone runs unprivileged with no setup.
 
 Exposing it to your local network is a deliberate act: change
 `HIGGSHOLE_BIND_HOST`. There is no authentication, by design.
