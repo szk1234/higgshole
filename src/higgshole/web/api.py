@@ -8,17 +8,24 @@ never a JSON number, and never 0 to mean unknown (spec section 3.4).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from higgshole.budget.estimator import (
+    Estimate,
+    estimate_image_cost,
+    estimate_video_cost,
+)
 from higgshole.budget.ledger import BudgetStatus
-from higgshole.catalog.validation import Severity, ValidationIssue
+from higgshole.catalog.validation import Severity, ValidationIssue, has_hard_failure
+from higgshole.jobs.runner import GenerationOutcome, GenerationRequest
 from higgshole.orclient.errors import (
     AuthError,
     IndeterminateError,
@@ -31,6 +38,7 @@ from higgshole.orclient.errors import (
 )
 from higgshole.orclient.types import ImageModel, KeyStatus, VideoModel
 from higgshole.store.db import (
+    TERMINAL_STATES,
     AssetKind,
     AssetRow,
     DuplicateSlugError,
@@ -39,6 +47,7 @@ from higgshole.store.db import (
     GenerationRow,
     GenerationState,
     InputRole,
+    MediaFilter,
 )
 from higgshole.web.app import AppState, get_state
 from higgshole.web.media import media_url_for, poster_url_for, thumb_url_for
@@ -432,8 +441,6 @@ async def list_models(
 
 @router.get("/projects", response_model=list[ProjectOut])
 async def list_projects(state: AppState = Depends(get_state)) -> list[ProjectOut]:
-    from higgshole.store.db import MediaFilter
-
     result: list[ProjectOut] = []
     for project in state.db.list_projects():
         count = state.db.count_generations(MediaFilter(project_slug=project.slug))
@@ -472,3 +479,278 @@ async def get_budget(state: AppState = Depends(get_state)) -> BudgetOut:
     """Provider-authoritative credit plus local cap status (spec section 3.2)."""
     key_status = await current_key_status(state)
     return _budget_out(await state.gate.status(key_status))
+
+
+#: How often a long-poll re-reads the row. Short enough to feel immediate,
+#: long enough that a five-minute wait is 600 cheap reads, not 300,000.
+JOB_POLL_INTERVAL_S: float = 0.5
+
+#: Non-terminal states, derived so a new state cannot be forgotten here.
+_IN_FLIGHT_STATES = tuple(s for s in GenerationState if s not in TERMINAL_STATES)
+
+
+class GenerateImageIn(BaseModel):
+    model: str
+    prompt: str
+    project: str = "unsorted"
+    aspect_ratio: str | None = None
+    resolution: str | None = None
+    size: str | None = None
+    quality: str | None = None
+    output_format: str | None = None
+    background: str | None = None
+    seed: int | None = None
+    input_reference_asset_ids: list[str] = []
+
+
+class GenerateVideoIn(BaseModel):
+    model: str
+    prompt: str
+    project: str = "unsorted"
+    duration: int | None = None
+    resolution: str | None = None
+    aspect_ratio: str | None = None
+    size: str | None = None
+    generate_audio: bool | None = None
+    seed: int | None = None
+    first_frame_asset_id: str | None = None
+    last_frame_asset_id: str | None = None
+    input_reference_asset_ids: list[str] = []
+
+
+#: Rejection/failure reason -> (HTTP status, stable code). Anything absent is
+#: reported as a completed-but-failed generation rather than an HTTP error.
+_REASON_STATUS: dict[ErrorReason, tuple[int, str]] = {
+    ErrorReason.VALIDATION: (422, "validation_failed"),
+    ErrorReason.CAP_EXCEEDED: (402, "local_daily_cap"),
+    ErrorReason.IN_FLIGHT_LIMIT: (429, "in_flight_limit"),
+    ErrorReason.INSUFFICIENT_CREDITS: (402, "provider_credit_limit"),
+    ErrorReason.MODERATION: (422, "moderation_refused"),
+    ErrorReason.INDETERMINATE: (502, "indeterminate"),
+}
+
+
+def _image_params(body: GenerateImageIn) -> dict[str, Any]:
+    fields = (
+        "aspect_ratio",
+        "resolution",
+        "size",
+        "quality",
+        "output_format",
+        "background",
+        "seed",
+    )
+    return {f: getattr(body, f) for f in fields if getattr(body, f) is not None}
+
+
+def _video_params(body: GenerateVideoIn) -> dict[str, Any]:
+    fields = (
+        "duration",
+        "resolution",
+        "aspect_ratio",
+        "size",
+        "generate_audio",
+        "seed",
+    )
+    return {f: getattr(body, f) for f in fields if getattr(body, f) is not None}
+
+
+def _require_project(state: AppState, slug: str):
+    project = state.db.get_project_by_slug(slug)
+    if project is None:
+        raise error_response(404, "project_not_found", f"No project with slug {slug!r}.")
+    return project
+
+
+async def _require_image_model(state: AppState, model_id: str) -> ImageModel:
+    model = await state.catalog.get_image_model(model_id)
+    if model is None:
+        raise error_response(404, "model_not_found", f"Unknown image model {model_id!r}.")
+    return model
+
+
+async def _require_video_model(state: AppState, model_id: str) -> VideoModel:
+    model = await state.catalog.get_video_model(model_id)
+    if model is None:
+        raise error_response(404, "model_not_found", f"Unknown video model {model_id!r}.")
+    return model
+
+
+def _outcome_or_raise(state: AppState, outcome: GenerationOutcome) -> GenerationOut:
+    """Turn a runner outcome into a response, or into the matching error.
+
+    A budget rejection is a normal result inside the runner, but it is an
+    error at the HTTP boundary: an agent must be able to branch on the code
+    without parsing prose (spec section 10).
+    """
+    if outcome.state in (GenerationState.REJECTED, GenerationState.FAILED):
+        mapped = (
+            _REASON_STATUS.get(outcome.error_reason) if outcome.error_reason else None
+        )
+        if mapped is not None:
+            status, code = mapped
+            raise error_response(status, code, outcome.error_detail or outcome.state.value)
+
+    row = state.db.get_generation(outcome.generation_id)
+    if row is None:  # pragma: no cover - the runner just wrote it
+        raise error_response(500, "internal_error", "generation row vanished")
+    return generation_out(state, row)
+
+
+@router.post("/estimate", response_model=EstimateOut)
+async def estimate(
+    kind: GenerationKind = Query(...),
+    body: dict[str, Any] = Body(...),
+    state: AppState = Depends(get_state),
+) -> EstimateOut:
+    """An advisory pre-flight cost, or an explicit reason it cannot be given."""
+    if kind is GenerationKind.IMAGE:
+        request = GenerateImageIn.model_validate(body)
+        model = await _require_image_model(state, request.model)
+        pricing = await state.catalog.get_image_pricing(model.id)
+        result: Estimate = estimate_image_cost(
+            model,
+            pricing,
+            quality=request.quality,
+            reference_count=len(request.input_reference_asset_ids),
+        )
+    else:
+        request_v = GenerateVideoIn.model_validate(body)
+        video_model = await _require_video_model(state, request_v.model)
+        result = estimate_video_cost(
+            video_model,
+            duration=request_v.duration,
+            resolution=request_v.resolution,
+            aspect_ratio=request_v.aspect_ratio,
+            generate_audio=bool(request_v.generate_audio),
+            has_frame_images=bool(
+                request_v.first_frame_asset_id or request_v.last_frame_asset_id
+            ),
+        )
+
+    return EstimateOut(
+        amount_usd=_decimal_out(result.amount),
+        estimate_unavailable=result.reason.value if result.reason else None,
+        detail=result.detail,
+    )
+
+
+@router.post("/generate/image", response_model=GenerationOut)
+async def generate_image(
+    body: GenerateImageIn, state: AppState = Depends(get_state)
+) -> GenerationOut:
+    """Synchronous: returns the finished asset (spec section 6.2)."""
+    await _require_image_model(state, body.model)
+    project = _require_project(state, body.project)
+
+    request = GenerationRequest(
+        kind=GenerationKind.IMAGE,
+        project_id=project.id,
+        project_slug=project.slug,
+        model=body.model,
+        prompt=body.prompt,
+        params=_image_params(body),
+        inputs=tuple(
+            (asset_id, InputRole.INPUT_REFERENCE)
+            for asset_id in body.input_reference_asset_ids
+        ),
+    )
+
+    # Ordering is fixed: local validation, budget gate, dispatch. Validating
+    # here as well as in the runner costs nothing and is what lets the API
+    # return structured issues instead of a bare message.
+    issues = await state.image_runner.validate(request)
+    if has_hard_failure(issues):
+        raise error_response(
+            422,
+            "validation_failed",
+            "The request violates the model's constraints.",
+            issues=issues,
+        )
+
+    try:
+        outcome = await state.image_runner.run(request)
+    except OpenRouterError as exc:
+        raise map_openrouter_error(exc) from exc
+
+    return _outcome_or_raise(state, outcome)
+
+
+@router.post("/generate/video", response_model=GenerationOut, status_code=202)
+async def generate_video(
+    body: GenerateVideoIn, state: AppState = Depends(get_state)
+) -> GenerationOut:
+    """Returns as soon as the provider job ID is committed; never blocks."""
+    await _require_video_model(state, body.model)
+    project = _require_project(state, body.project)
+
+    inputs: list[tuple[str, InputRole]] = []
+    if body.first_frame_asset_id:
+        inputs.append((body.first_frame_asset_id, InputRole.FIRST_FRAME))
+    if body.last_frame_asset_id:
+        inputs.append((body.last_frame_asset_id, InputRole.LAST_FRAME))
+    inputs += [
+        (asset_id, InputRole.INPUT_REFERENCE)
+        for asset_id in body.input_reference_asset_ids
+    ]
+
+    request = GenerationRequest(
+        kind=GenerationKind.VIDEO,
+        project_id=project.id,
+        project_slug=project.slug,
+        model=body.model,
+        prompt=body.prompt,
+        params=_video_params(body),
+        inputs=tuple(inputs),
+    )
+
+    issues = await state.video_runner.validate(request)
+    if has_hard_failure(issues):
+        raise error_response(
+            422,
+            "validation_failed",
+            "The request violates the model's constraints.",
+            issues=issues,
+        )
+
+    try:
+        outcome = await state.video_runner.submit(request)
+    except OpenRouterError as exc:
+        raise map_openrouter_error(exc) from exc
+
+    return _outcome_or_raise(state, outcome)
+
+
+@router.get("/jobs", response_model=list[GenerationOut])
+async def list_jobs(state: AppState = Depends(get_state)) -> list[GenerationOut]:
+    """Every generation not yet in a terminal state."""
+    rows = state.db.list_generations_in_states(_IN_FLIGHT_STATES)
+    return [generation_out(state, row) for row in rows]
+
+
+@router.get("/jobs/{gen_id}", response_model=GenerationOut)
+async def get_job(
+    gen_id: str,
+    wait_seconds: int = Query(default=0, ge=0, le=600),
+    state: AppState = Depends(get_state),
+) -> GenerationOut:
+    """Current status, optionally long-polled.
+
+    The wait is bounded by the caller, not by the server, so an agent's own
+    timeout governs how long it blocks (spec section 6.2).
+    """
+    row = state.db.get_generation(gen_id)
+    if row is None:
+        raise error_response(404, "generation_not_found", f"No generation {gen_id!r}.")
+
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while row.state not in TERMINAL_STATES:
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(JOB_POLL_INTERVAL_S)
+        refreshed = state.db.get_generation(gen_id)
+        if refreshed is None:  # pragma: no cover - deleted mid-poll
+            break
+        row = refreshed
+
+    return generation_out(state, row)
