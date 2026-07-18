@@ -360,3 +360,168 @@ def build_tools() -> list[types.Tool]:
 
 async def handle_list_tools() -> list[types.Tool]:
     return build_tools()
+
+
+def with_local_path(asset: dict[str, Any], base_url: str) -> dict[str, Any]:
+    """Guarantee an asset carries both a local path and an HTTP URL.
+
+    Agents run on the same host as the service (spec section 6.2), so both
+    forms are useful: the path for direct reads, the URL for anything that
+    speaks HTTP. The API already returns both; this asserts their presence
+    rather than computing them, and absolutises the relative URL so the agent
+    does not have to know the base.
+    """
+    for field in ("local_path", "url"):
+        if not asset.get(field):
+            raise ToolError(
+                "internal_error",
+                f"the API returned an asset without a {field}; this is a server bug",
+            )
+
+    url = str(asset["url"])
+    if url.startswith("/"):
+        asset = {**asset, "url": f"{base_url}{url}"}
+    return asset
+
+
+def _with_asset_urls(generation: dict[str, Any], base_url: str) -> dict[str, Any]:
+    """Apply with_local_path to a generation's asset when it has one.
+
+    A generation in flight has ``asset: null``; that is not an error, so the
+    assertion applies only once an asset exists.
+    """
+    asset = generation.get("asset")
+    if not isinstance(asset, dict):
+        return generation
+    return {**generation, "asset": with_local_path(asset, base_url)}
+
+
+async def tool_list_models(api: HiggsHoleAPI, *, kind: str | None = None) -> list[dict[str, Any]]:
+    payload = await api.request("GET", "/api/models", params={"kind": kind})
+    return list(payload.get("items", []))
+
+
+async def tool_generate_image(
+    api: HiggsHoleAPI,
+    *,
+    model: str,
+    prompt: str,
+    project: str = "unsorted",
+    aspect_ratio: str | None = None,
+    resolution: str | None = None,
+    size: str | None = None,
+    quality: str | None = None,
+    output_format: str | None = None,
+    seed: int | None = None,
+    input_reference_asset_ids: list[str] | None = None,
+    n: int = 1,
+) -> dict[str, Any]:
+    """Generate one image synchronously.
+
+    ``n`` is rejected here rather than forwarded: refusing locally means a
+    mistaken batch request never reaches a billable endpoint (spec section 5.5).
+    """
+    if n != 1:
+        raise ToolError(
+            "batch_not_supported",
+            f"n is fixed at 1 so that each generation has its own cost record; got {n}",
+        )
+
+    body = _without_nones(
+        {
+            "model": model,
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "size": size,
+            "quality": quality,
+            "output_format": output_format,
+            "seed": seed,
+        }
+    )
+    body["project"] = project
+    body["input_reference_asset_ids"] = list(input_reference_asset_ids or [])
+
+    payload = await api.request("POST", "/api/generate/image", json_body=body)
+    return _with_asset_urls(payload, api.base_url)
+
+
+async def tool_generate_video(
+    api: HiggsHoleAPI,
+    *,
+    model: str,
+    prompt: str,
+    project: str = "unsorted",
+    duration: int | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str | None = None,
+    generate_audio: bool | None = None,
+    seed: int | None = None,
+    first_frame_asset_id: str | None = None,
+    last_frame_asset_id: str | None = None,
+    input_reference_asset_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Submit a video job and return as soon as the API has its ID.
+
+    Exactly one HTTP request is made. Waiting for a multi-minute render inside
+    a single tool call invites client timeouts (spec section 6.2); get_job does
+    the waiting, bounded by the caller.
+    """
+    body = _without_nones(
+        {
+            "model": model,
+            "prompt": prompt,
+            "duration": duration,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": generate_audio,
+            "seed": seed,
+            "first_frame_asset_id": first_frame_asset_id,
+            "last_frame_asset_id": last_frame_asset_id,
+        }
+    )
+    body["project"] = project
+    body["input_reference_asset_ids"] = list(input_reference_asset_ids or [])
+
+    payload = await api.request("POST", "/api/generate/video", json_body=body)
+    return _with_asset_urls(payload, api.base_url)
+
+
+async def tool_get_job(
+    api: HiggsHoleAPI, *, generation_id: str, wait_seconds: int = 0
+) -> dict[str, Any]:
+    """Current state of one generation, optionally long-polled.
+
+    The wait is performed server-side and bounded by the caller's own value,
+    clamped to MAX_WAIT_SECONDS so a mistaken argument cannot pin the
+    connection open.
+    """
+    bounded = max(0, min(int(wait_seconds), MAX_WAIT_SECONDS))
+    payload = await api.request(
+        "GET", f"/api/jobs/{generation_id}", params={"wait_seconds": bounded}
+    )
+    return _with_asset_urls(payload, api.base_url)
+
+
+async def dispatch(api: HiggsHoleAPI, name: str, arguments: dict[str, Any]) -> Any:
+    """Route one tool call to its handler.
+
+    A TypeError from the call is reported as validation_failed: with closed
+    input schemas the only way to reach it is a missing or misnamed argument,
+    and the handlers themselves perform no arithmetic that could raise one.
+    """
+    handler = TOOL_HANDLERS.get(name)
+    if handler is None:
+        raise ToolError("internal_error", f"unknown tool: {name}")
+    try:
+        return await handler(api, **arguments)
+    except TypeError as exc:
+        raise ToolError("validation_failed", f"{name}: {exc}") from exc
+
+
+TOOL_HANDLERS: dict[str, Any] = {
+    "list_models": tool_list_models,
+    "generate_image": tool_generate_image,
+    "generate_video": tool_generate_video,
+    "get_job": tool_get_job,
+}
