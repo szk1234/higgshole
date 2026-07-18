@@ -7,7 +7,9 @@ tests stub one function rather than the whole of ``subprocess``.
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Sequence
@@ -15,9 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
-from .files import file_size
+from .files import atomic_write_bytes, delete_quietly, discard_part, file_size
 
 #: The single tag name under which all parameters are embedded: PNG tEXt key,
 #: EXIF UserComment payload prefix, and MP4 '-metadata comment=' value. One key
@@ -296,3 +298,240 @@ def probe_media(path: Path) -> MediaMetadata:
     """Dispatch on suffix. Raises UnsupportedMediaError for other types."""
     mime = mime_for(path)
     return probe_video(path) if _is_video(mime) else probe_image(path)
+
+
+# -- embedding ------------------------------------------------------------
+
+
+def _payload_json(payload: dict[str, Any]) -> str:
+    """Compact JSON under a single top-level key.
+
+    Wrapping in PARAM_TAG_KEY means the MP4 ``comment`` tag — which is shared
+    with every other tool that writes comments — is unambiguously ours.
+    """
+    return json.dumps({PARAM_TAG_KEY: payload}, sort_keys=True, separators=(",", ":"))
+
+
+def embed_image_params(path: Path, payload: dict[str, Any]) -> None:
+    """Rewrite the image in place with parameters embedded (spec 5.3).
+
+    PNG gets a tEXt chunk keyed PARAM_TAG_KEY; JPEG and WebP get an EXIF
+    UserComment. The result is written via atomic_write_bytes, so a failure
+    here never truncates the image that was just paid for.
+    """
+    path = Path(path)
+    mime = mime_for(path)
+    text = _payload_json(payload)
+    buffer = io.BytesIO()
+
+    with Image.open(path) as image:
+        image.load()
+        if mime == "image/png":
+            info = PngImagePlugin.PngInfo()
+            info.add_text(PARAM_TAG_KEY, text)
+            image.save(buffer, format="PNG", pnginfo=info)
+        elif mime in {"image/jpeg", "image/webp"}:
+            exif = image.getexif()
+            exif[_EXIF_USER_COMMENT] = _EXIF_PREFIX + text.encode("utf-8")
+            image.save(
+                buffer,
+                format="JPEG" if mime == "image/jpeg" else "WEBP",
+                exif=exif,
+                quality=95,
+            )
+        else:
+            raise UnsupportedMediaError(f"cannot embed parameters into {mime}")
+
+    atomic_write_bytes(path, buffer.getvalue())
+
+
+def embed_video_params(path: Path, payload: dict[str, Any]) -> None:
+    """Remux with the parameters in the container comment tag.
+
+    Stream-copy only (``-c copy``): re-encoding a paid generation to attach a
+    tag would be indefensible. The muxer is named explicitly with ``-f``
+    because the intermediate file is ``<name>.part``, whose extension ffmpeg
+    cannot use to infer a format.
+    """
+    path = Path(path)
+    mime = mime_for(path)
+    if not _is_video(mime):
+        raise UnsupportedMediaError(f"not a video: {path}")
+
+    muxer = "mp4" if mime == "video/mp4" else "webm"
+    part = path.with_name(path.name + ".part")
+
+    try:
+        _run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-c",
+                "copy",
+                "-map_metadata",
+                "0",
+                "-metadata",
+                f"comment={_payload_json(payload)}",
+                "-f",
+                muxer,
+                "-y",
+                str(part),
+            ]
+        )
+    except BaseException:
+        discard_part(path)
+        raise
+
+    os.replace(part, path)
+
+
+def embed_params(path: Path, payload: dict[str, Any]) -> None:
+    """Dispatch by media type.
+
+    A failure here is logged and swallowed by the caller: the sidecar is the
+    authoritative record, embedding is a convenience, and a metadata failure
+    must not fail a paid generation.
+    """
+    if _is_video(mime_for(path)):
+        embed_video_params(path, payload)
+    else:
+        embed_image_params(path, payload)
+
+
+def read_embedded_params(path: Path) -> dict[str, Any]:
+    """Extract PARAM_TAG_KEY, returning {} when absent or unparseable."""
+    path = Path(path)
+    if _is_video(mime_for(path)):
+        try:
+            return probe_video(path).embedded_params
+        except MetadataError:
+            return {}
+    with Image.open(path) as image:
+        return read_embedded_params_from_image(image)
+
+
+# -- thumbnails -----------------------------------------------------------
+
+
+def make_image_thumbnail(
+    source: Path, destination: Path, *, max_edge: int = THUMBNAIL_MAX_EDGE
+) -> MediaMetadata:
+    """Write a WebP thumbnail preserving aspect ratio; returns its metadata."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    buffer = io.BytesIO()
+
+    with Image.open(source) as image:
+        image.load()
+        # P and CMYK have no direct WebP encoding; RGBA does and is preserved.
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+        image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        image.save(buffer, format=THUMBNAIL_FORMAT.upper(), quality=82, method=4)
+
+    atomic_write_bytes(destination, buffer.getvalue())
+    return probe_image(destination)
+
+
+def _extract_frame(source: Path, destination: Path, *, at_seconds: float) -> None:
+    """Extract one frame to `destination` as WebP.
+
+    ffmpeg decodes the frame to PNG and Pillow performs the WebP encode. Going
+    straight to ``-f webp`` would bind us to an ffmpeg built with libwebp,
+    which many distribution builds omit — the muxer is always present but the
+    encoder frequently is not, and that failure only surfaces at the first
+    video generation. Pillow's WebP support is a hard dependency here, so the
+    encode is guaranteed to be available wherever the application runs.
+    """
+    part = destination.with_name(destination.name + ".part")
+    frame = destination.with_name(destination.name + ".frame.png")
+    try:
+        _run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{at_seconds:.3f}",
+                "-i",
+                str(source),
+                "-frames:v",
+                "1",
+                "-f",
+                "image2",
+                "-c:v",
+                "png",
+                "-y",
+                str(frame),
+            ]
+        )
+
+        # Seeking past the end of a short clip makes ffmpeg exit 0 having
+        # written nothing. Report that as a MetadataError so make_video_poster
+        # falls back to timestamp 0 rather than raising an opaque I/O error.
+        if not frame.exists() or file_size(frame) == 0:
+            raise MetadataError(
+                f"ffmpeg produced no frame from {source} at {at_seconds:.3f}s"
+            )
+
+        buffer = io.BytesIO()
+        with Image.open(frame) as image:
+            image.load()
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            image.save(buffer, format=THUMBNAIL_FORMAT.upper(), quality=82, method=4)
+        part.write_bytes(buffer.getvalue())
+    except BaseException:
+        discard_part(destination)
+        raise
+    finally:
+        delete_quietly(frame)
+
+    os.replace(part, destination)
+
+
+def make_video_poster(
+    source: Path, destination: Path, *, at_seconds: float = POSTER_TIMESTAMP_S
+) -> MediaMetadata:
+    """Extract one frame as WebP.
+
+    Falls back to timestamp 0 when the video is shorter than `at_seconds`:
+    seeking past the end yields an empty output rather than an error on some
+    ffmpeg builds, so the fallback is triggered by an unusable result as well
+    as by a failure.
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _extract_frame(source, destination, at_seconds=at_seconds)
+        if destination.exists() and file_size(destination) > 0:
+            return probe_image(destination)
+    except MetadataError:
+        pass
+
+    delete_quietly(destination)
+    _extract_frame(source, destination, at_seconds=0.0)
+    return probe_image(destination)
+
+
+def make_video_thumbnail(
+    source: Path,
+    destination: Path,
+    *,
+    max_edge: int = THUMBNAIL_MAX_EDGE,
+    at_seconds: float = POSTER_TIMESTAMP_S,
+) -> MediaMetadata:
+    """Poster frame downscaled to thumbnail size."""
+    destination = Path(destination)
+    frame = destination.with_name(destination.name + ".frame.webp")
+    try:
+        make_video_poster(source, frame, at_seconds=at_seconds)
+        return make_image_thumbnail(frame, destination, max_edge=max_edge)
+    finally:
+        delete_quietly(frame)
