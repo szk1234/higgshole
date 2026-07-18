@@ -102,6 +102,8 @@ class CatalogCache:
             # Per-kind selection (spec section 7): an or-chain across the three
             # keys would fetch the image catalogue with the video key whenever
             # only HIGGSHOLE_OPENROUTER_API_KEY_VIDEO is set.
+            # A blank key raises AuthError here, recorded as the catalogue
+            # status rather than surfacing as a transport error later.
             return OpenRouterClient(settings.openrouter_api_key_for(kind) or "")
 
         return cls(db, factory, ttl_hours=settings.catalog_ttl_hours)

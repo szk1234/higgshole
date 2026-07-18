@@ -63,6 +63,13 @@ class OpenRouterClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 30.0,
     ) -> None:
+        # Fail fast and legibly on a missing key. httpx accepts the resulting
+        # "Bearer " header at construction and only rejects it at request time
+        # with "Illegal header value", which surfaces to a first-run operator
+        # as an inscrutable transport error rather than "set an API key".
+        if not api_key or not api_key.strip():
+            raise AuthError("No OpenRouter API key configured.")
+
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             base_url=self._base_url,

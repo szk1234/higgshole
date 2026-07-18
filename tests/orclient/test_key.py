@@ -2,8 +2,8 @@ import httpx
 import pytest
 import respx
 
-from higgshole.orclient.client import looks_like_openrouter_key
-from higgshole.orclient.errors import ProviderError
+from higgshole.orclient.client import OpenRouterClient, looks_like_openrouter_key
+from higgshole.orclient.errors import AuthError, ProviderError
 
 BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -78,3 +78,15 @@ def test_key_shape_is_checked_before_submission(candidate, expected):
     # The server's messages do not clearly distinguish a foreign key from an
     # absent one, so the shape check happens locally (spec section 7).
     assert looks_like_openrouter_key(candidate) is expected
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_a_blank_key_fails_fast_with_a_legible_message(blank):
+    """A missing key must not become an inscrutable transport error.
+
+    httpx accepts the resulting "Bearer " header at construction and rejects it
+    only at request time as "Illegal header value", which a first-run operator
+    cannot act on. Failing here says what to actually do.
+    """
+    with pytest.raises(AuthError, match="No OpenRouter API key configured"):
+        OpenRouterClient(blank)

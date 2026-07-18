@@ -119,7 +119,10 @@ def build_app_state(settings: Settings, db: Database | None = None) -> AppState:
         """A fresh client per call, with the key resolved at call time, so a
         key saved through the UI takes effect on the next request rather than
         at the next restart."""
-        return OpenRouterClient(resolve_api_key(database, settings, kind) or "")
+        key = resolve_api_key(database, settings, kind)
+        # OpenRouterClient raises AuthError on a blank key, which callers
+        # already treat as "provider unavailable" rather than crashing.
+        return OpenRouterClient(key or "")
 
     # Not `CatalogCache.from_settings`: that builds its own environment-only
     # factory, so a key saved through the UI would never reach a catalogue
