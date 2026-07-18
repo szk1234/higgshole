@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Settings · HiggsHole{% endblock %}
+{% block content %}
+<form class="panel" id="settings-form">
+  <h3>API keys</h3>
+  <p class="muted">
+    Keys are write-only. After saving, only the last four characters are ever
+    shown again.
+  </p>
+
+  <label for="openrouter_api_key">Shared key ({{ settings.openrouter_api_key_masked or "not set" }})</label>
+  <input id="openrouter_api_key" name="openrouter_api_key" type="password"
+         pattern="sk-or-v1-.+" placeholder="sk-or-v1-…"
+         title="An OpenRouter key begins sk-or-v1-" />
+
+  <label for="openrouter_api_key_image">Image key ({{ settings.openrouter_api_key_image_masked or "falls back to shared" }})</label>
+  <input id="openrouter_api_key_image" name="openrouter_api_key_image" type="password"
+         pattern="sk-or-v1-.+" placeholder="sk-or-v1-…" />
+
+  <label for="openrouter_api_key_video">Video key ({{ settings.openrouter_api_key_video_masked or "falls back to shared" }})</label>
+  <input id="openrouter_api_key_video" name="openrouter_api_key_video" type="password"
+         pattern="sk-or-v1-.+" placeholder="sk-or-v1-…" />
+
+  <label for="daily_cap_usd">Local daily cap (USD, blank for none)</label>
+  <input id="daily_cap_usd" name="daily_cap_usd" value="{{ settings.daily_cap_usd or '' }}" />
+
+  <p><button type="submit">Save</button></p>
+</form>
+
+<div class="panel">
+  <h3>Catalogue</h3>
+  <table>
+    <tr><th>Images fetched</th><td>{{ settings.catalog.image_fetched_at or "never" }}</td></tr>
+    <tr><th>Videos fetched</th><td>{{ settings.catalog.video_fetched_at or "never" }}</td></tr>
+    <tr><th>Stale</th><td>{{ "yes" if settings.catalog.is_stale else "no" }}</td></tr>
+    {% if settings.catalog.last_error %}
+      <tr><th>Last error</th><td class="issue-advisory">{{ settings.catalog.last_error }}</td></tr>
+    {% endif %}
+  </table>
+  <p>
+    <button hx-post="/api/settings/catalog/refresh" hx-swap="none">Refresh catalogue</button>
+    <button hx-post="/api/settings/rescan" hx-swap="none">Rescan media from disk</button>
+  </p>
+</div>
+
+<div class="panel">
+  <h3>Environment</h3>
+  <table>
+    <tr><th>ffmpeg and ffprobe</th><td>{{ "available" if settings.ffmpeg_available else "MISSING — video will fail" }}</td></tr>
+    <tr><th>Reference transport</th><td class="mono">{{ settings.reference_transport }}</td></tr>
+    <tr><th>Video reference slots</th><td>{{ "offered" if settings.video_references_supported else "disabled for this transport" }}</td></tr>
+  </table>
+  {% if resume_report %}
+    <p class="muted">
+      Last restart reattached {{ resume_report.reattached|length }} job(s),
+      timed out {{ resume_report.timed_out|length }}, and could not recover
+      {{ resume_report.orphaned|length }}.
+    </p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Library · HiggsHole{% endblock %}
+{% block content %}
+<form class="panel" id="library-filters"
+      hx-get="/partials/library-grid" hx-target="#library-grid" hx-trigger="change">
+  <label for="project">Project</label>
+  <select id="project" name="project">
+    <option value="">All projects</option>
+    {% for project in projects %}
+      <option value="{{ project.slug }}" {{ 'selected' if project.slug == selected_project }}>
+        {{ project.name }} ({{ project.item_count }})
+      </option>
+    {% endfor %}
+  </select>
+
+  <label for="kind">Type</label>
+  <select id="kind" name="kind">
+    <option value="">Everything</option>
+    <option value="image">Images</option>
+    <option value="video">Videos</option>
+  </select>
+
+  <label for="model">Model</label>
+  <input id="model" name="model" placeholder="Any model" />
+</form>
+
+<div id="library-grid">{% include "partials/library_grid.html" %}</div>
+{% endblock %}

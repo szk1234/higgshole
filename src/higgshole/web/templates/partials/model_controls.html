@@ -1,0 +1,81 @@
+{% if model %}
+  <fieldset class="panel">
+    <legend class="muted">{{ model.name }}</legend>
+
+    {% if model.supported_aspect_ratios %}
+      <label for="aspect_ratio">Aspect ratio</label>
+      <select id="aspect_ratio" name="aspect_ratio">
+        {% for value in model.supported_aspect_ratios %}
+          <option value="{{ value }}">{{ value }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
+
+    {% if model.supported_resolutions %}
+      <label for="resolution">Resolution</label>
+      <select id="resolution" name="resolution">
+        {% for value in model.supported_resolutions %}
+          <option value="{{ value }}">{{ value }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
+
+    {% if model.supported_durations %}
+      <label for="duration">Duration (seconds)</label>
+      <select id="duration" name="duration">
+        {% for value in model.supported_durations %}
+          <option value="{{ value }}">{{ value }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
+
+    {% if model.quality_values %}
+      <label for="quality">Quality</label>
+      <select id="quality" name="quality">
+        {% for value in model.quality_values %}
+          <option value="{{ value }}">{{ value }}</option>
+        {% endfor %}
+      </select>
+    {% endif %}
+
+    {% if model.generate_audio %}
+      <label for="generate_audio">Generate audio</label>
+      <select id="generate_audio" name="generate_audio">
+        <option value="false">No</option>
+        <option value="true">Yes</option>
+      </select>
+    {% endif %}
+
+    {% if model.seed %}
+      <label for="seed">Seed</label>
+      <input id="seed" name="seed" type="number" placeholder="leave blank for random" />
+    {% endif %}
+
+    {% if model.kind == "video" %}
+      {% if model.supported_frame_images and video_references_supported %}
+        {% if "first_frame" in model.supported_frame_images %}
+          <label for="first_frame_asset_id">First frame (asset id)</label>
+          <input id="first_frame_asset_id" name="first_frame_asset_id" />
+        {% endif %}
+        {% if "last_frame" in model.supported_frame_images %}
+          <label for="last_frame_asset_id">Last frame (asset id)</label>
+          <input id="last_frame_asset_id" name="last_frame_asset_id" />
+        {% endif %}
+      {% elif model.supported_frame_images and not video_references_supported %}
+        <p class="issue-advisory">
+          Reference images are unavailable: the configured transport cannot
+          deliver a local file to the provider.
+        </p>
+      {% else %}
+        <p class="muted">{{ model.name }} is text-to-video only.</p>
+      {% endif %}
+    {% else %}
+      {% for slot in range(model.max_input_references) %}
+        <label for="input_reference_{{ slot }}">Reference image {{ slot + 1 }} (asset id)</label>
+        <input id="input_reference_{{ slot }}" name="input_reference_asset_ids" />
+      {% endfor %}
+    {% endif %}
+  </fieldset>
+{% else %}
+  <p class="muted">Choose a model to see its options.</p>
+{% endif %}

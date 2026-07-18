@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Jobs · HiggsHole{% endblock %}
+{% block content %}
+<div class="panel" hx-ext="sse" sse-connect="/events/jobs">
+  <h3>In flight</h3>
+  <table id="job-table" sse-swap="job" hx-swap="afterbegin">
+    <tr><th>Generation</th><th>Kind</th><th>State</th><th>Model</th></tr>
+    {% for job in jobs %}
+      {% with item = job %}{% include "partials/job_row.html" %}{% endwith %}
+    {% endfor %}
+  </table>
+  {% if not jobs %}<p class="muted">Nothing is running.</p>{% endif %}
+</div>
+{% endblock %}

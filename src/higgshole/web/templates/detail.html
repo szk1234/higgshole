@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}{{ item.id }} · HiggsHole{% endblock %}
+{% block content %}
+<div class="panel">
+  {% if item.asset %}
+    {% if item.kind == "video" %}
+      <video controls preload="metadata" style="max-width:100%"
+             {% if item.poster_url %}poster="{{ item.poster_url }}"{% endif %}
+             src="{{ item.asset.url }}"></video>
+    {% else %}
+      <img src="{{ item.asset.url }}" alt="{{ item.prompt }}" style="max-width:100%" />
+    {% endif %}
+  {% else %}
+    <p class="muted">No media on disk for this generation ({{ item.state }}).</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <table>
+    <tr><th>Prompt</th><td>{{ item.prompt }}</td></tr>
+    <tr><th>Model</th><td class="mono">{{ item.model }}</td></tr>
+    <tr><th>State</th><td>{{ item.state }}</td></tr>
+    <tr><th>Project</th><td>{{ item.project_slug }}</td></tr>
+    <tr>
+      <th>Cost</th>
+      <td>{{ item.cost_usd if item.cost_known else "not reported by the provider" }}</td>
+    </tr>
+    <tr><th>Created</th><td>{{ item.created_at }}</td></tr>
+    {% if item.asset %}
+      <tr><th>Local path</th><td class="mono">{{ item.asset.local_path }}</td></tr>
+    {% endif %}
+    {% if item.error_reason %}
+      <tr><th>Error</th><td class="issue-hard">{{ item.error_reason }} — {{ item.error_detail }}</td></tr>
+    {% endif %}
+  </table>
+  {% for key, value in item.params.items() %}
+    <p class="muted mono">{{ key }} = {{ value }}</p>
+  {% endfor %}
+</div>
+
+<div class="panel">
+  <h3>Lineage</h3>
+  {% if item.inputs %}
+    <div class="grid">
+      {% for input in item.inputs %}
+        <div class="card">
+          {% if input.thumb_url %}<img src="{{ input.thumb_url }}" alt="input" />{% endif %}
+          <div class="caption">{{ input.role }} #{{ input.position }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">This generation used no inputs.</p>
+  {% endif %}
+</div>
+{% endblock %}

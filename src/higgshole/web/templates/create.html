@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Create · HiggsHole{% endblock %}
+{% block content %}
+<form class="panel" id="create-form">
+  <label for="kind">Type</label>
+  <select id="kind" name="kind"
+          hx-get="/partials/model-controls" hx-target="#model-controls"
+          hx-include="#create-form">
+    <option value="image">Image</option>
+    <option value="video">Video</option>
+  </select>
+
+  <label for="model">Model</label>
+  <select id="model" name="model"
+          hx-get="/partials/model-controls" hx-target="#model-controls"
+          hx-include="#create-form">
+    {% for model in favourites %}
+      <option value="{{ model.id }}">★ {{ model.name }}</option>
+    {% endfor %}
+    {% for model in models %}
+      <option value="{{ model.id }}">{{ model.name }} ({{ model.kind }})</option>
+    {% endfor %}
+  </select>
+
+  <label for="project">Project</label>
+  <select id="project" name="project">
+    {% for project in projects %}
+      <option value="{{ project.slug }}">{{ project.name }}</option>
+    {% endfor %}
+  </select>
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" name="prompt" rows="4"
+            placeholder="Passed to the provider verbatim"></textarea>
+
+  <div id="model-controls">{% include "partials/model_controls.html" %}</div>
+
+  <div id="estimate" hx-get="/partials/estimate" hx-trigger="change from:#create-form"
+       hx-include="#create-form">
+    {% include "partials/estimate.html" %}
+  </div>
+
+  <p><button type="submit">Generate</button></p>
+</form>
+{% endblock %}

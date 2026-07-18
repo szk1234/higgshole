@@ -1,0 +1,10 @@
+{% if estimate is none %}
+  <p class="muted">Choose a model to see an estimate.</p>
+{% elif estimate.amount_usd %}
+  <p>Estimated cost: <strong>{{ estimate.amount_usd }} USD</strong></p>
+{% else %}
+  <p class="issue-advisory">
+    No estimate available ({{ estimate.estimate_unavailable }}):
+    {{ estimate.detail }}
+  </p>
+{% endif %}

@@ -1,0 +1,82 @@
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --line: #2c313b;
+  --text: #e6e8ec;
+  --muted: #9aa3b2;
+  --accent: #6ea8fe;
+  --warn: #e0b354;
+  --bad: #e06c75;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, sans-serif;
+}
+
+header.topbar {
+  display: flex;
+  gap: 1.5rem;
+  align-items: baseline;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+}
+
+header.topbar a { color: var(--muted); text-decoration: none; }
+header.topbar a.active, header.topbar a:hover { color: var(--text); }
+header.topbar .budget { margin-left: auto; color: var(--muted); font-size: 0.9em; }
+
+main { padding: 1.25rem; max-width: 1200px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+label { display: block; margin: 0.75rem 0 0.25rem; color: var(--muted); }
+
+input, select, textarea, button {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  width: 100%;
+}
+
+button {
+  width: auto;
+  cursor: pointer;
+  border-color: var(--accent);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.card { position: relative; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.card img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; background: #000; }
+.card .caption { padding: 0.4rem 0.5rem; font-size: 0.85em; color: var(--muted); }
+.badge {
+  position: absolute; top: 0.4rem; right: 0.4rem;
+  background: rgba(0, 0, 0, 0.7); border-radius: 4px;
+  padding: 0.1rem 0.35rem; font-size: 0.75em;
+}
+
+.issue-hard { color: var(--bad); }
+.issue-advisory { color: var(--warn); }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, monospace; }
+
+table { width: 100%; border-collapse: collapse; }
+td, th { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); }

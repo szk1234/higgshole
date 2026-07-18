@@ -1,0 +1,16 @@
+<div class="grid">
+  {% for item in items %}
+    <a class="card" href="/library/{{ item.id }}">
+      {% if item.thumb_url %}
+        <img src="{{ item.thumb_url }}" alt="{{ item.prompt }}" loading="lazy" />
+      {% endif %}
+      {% if item.kind == "video" and item.asset and item.asset.duration_s %}
+        <span class="badge">{{ "%.0f"|format(item.asset.duration_s) }}s</span>
+      {% endif %}
+      <span class="caption">{{ item.prompt[:60] }}</span>
+      <span class="caption mono">{{ item.id }}</span>
+    </a>
+  {% else %}
+    <p class="muted">Nothing here yet.</p>
+  {% endfor %}
+</div>

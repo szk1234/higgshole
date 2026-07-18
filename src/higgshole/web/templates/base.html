@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}HiggsHole{% endblock %}</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="/static/vendor/htmx.min.js" defer></script>
+    <script src="/static/vendor/htmx-sse.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <strong>HiggsHole</strong>
+      <a href="/" class="{{ 'active' if screen == 'create' }}">Create</a>
+      <a href="/library" class="{{ 'active' if screen == 'library' }}">Library</a>
+      <a href="/jobs" class="{{ 'active' if screen == 'jobs' }}">Jobs</a>
+      <a href="/settings" class="{{ 'active' if screen == 'settings' }}">Settings</a>
+      <span class="budget">
+        {% if budget.provider_available %}
+          {{ budget.provider_remaining_usd or "—" }} USD remaining
+        {% else %}
+          local only
+        {% endif %}
+        {% if budget.cap_usd %}
+          · cap {{ budget.cap_usd }} · spent {{ "≥" if budget.is_lower_bound }}{{ budget.spent_today_usd }}
+        {% endif %}
+      </span>
+    </header>
+    <main>{% block content %}{% endblock %}</main>
+  </body>
+</html>

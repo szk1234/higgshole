@@ -1,0 +1,11 @@
+<tr id="job-{{ item.id }}">
+  <td class="mono"><a href="/library/{{ item.id }}">{{ item.id }}</a></td>
+  <td>{{ item.kind }}</td>
+  <td>
+    {{ item.state }}
+    {% if item.error_reason %}
+      <span class="issue-hard">({{ item.error_reason }})</span>
+    {% endif %}
+  </td>
+  <td class="mono">{{ item.model }}</td>
+</tr>
