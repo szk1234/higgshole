@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import httpx
+import mcp.types as types
 
 #: Where the REST API listens when nothing overrides it (spec section 8).
 DEFAULT_API_BASE: str = "http://127.0.0.1:8077"
@@ -153,3 +154,209 @@ class HiggsHoleAPI:
         if not isinstance(payload, dict):
             return {"value": payload}
         return payload
+
+
+#: The eleven tools of spec section 6.2, in specification order.
+TOOL_NAMES: tuple[str, ...] = (
+    "list_models",
+    "generate_image",
+    "generate_video",
+    "get_job",
+    "upload_asset",
+    "list_media",
+    "get_media",
+    "delete_media",
+    "list_projects",
+    "create_project",
+    "get_budget",
+)
+
+#: Long-poll ceiling for get_job. Bounded here as well as by the caller so that
+#: a mistaken wait_seconds cannot hold an agent's tool call open indefinitely.
+MAX_WAIT_SECONDS: int = 300
+
+_PROJECT_PROPERTY = {
+    "type": "string",
+    "description": "Project slug. Defaults to 'unsorted', which always exists.",
+    "default": "unsorted",
+}
+
+_ASSET_ID_LIST = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Asset IDs previously returned by upload_asset, get_media or a "
+        "generation tool, used as image references."
+    ),
+    "default": [],
+}
+
+
+def _object_schema(
+    properties: dict[str, Any], required: list[str] | None = None
+) -> dict[str, Any]:
+    """A closed JSON Schema object.
+
+    additionalProperties is false so an agent that misspells a parameter is
+    told so by its own client rather than having the value silently dropped on
+    a request that then costs money.
+    """
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+        "additionalProperties": False,
+    }
+
+
+TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "list_models": _object_schema(
+        {
+            "kind": {
+                "type": "string",
+                "enum": ["image", "video"],
+                "description": "Restrict the listing to one media kind.",
+            }
+        }
+    ),
+    "generate_image": _object_schema(
+        {
+            "model": {"type": "string", "description": "Model ID from list_models."},
+            "prompt": {"type": "string", "description": "Passed to the provider verbatim."},
+            "project": _PROJECT_PROPERTY,
+            "aspect_ratio": {"type": "string"},
+            "resolution": {"type": "string", "enum": ["512", "1K", "2K", "4K"]},
+            "size": {
+                "type": "string",
+                "description": (
+                    "Explicit pixel dimensions, e.g. '1920x1080'. Authoritative: "
+                    "a conflicting resolution or aspect_ratio is rejected."
+                ),
+            },
+            "quality": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
+            "output_format": {"type": "string", "enum": ["png", "jpeg", "webp", "svg"]},
+            "seed": {"type": "integer"},
+            "input_reference_asset_ids": _ASSET_ID_LIST,
+            "n": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1,
+                "default": 1,
+                "description": "Fixed at 1; batch generation is not supported.",
+            },
+        },
+        ["model", "prompt"],
+    ),
+    "generate_video": _object_schema(
+        {
+            "model": {"type": "string", "description": "Model ID from list_models."},
+            "prompt": {"type": "string", "description": "Passed to the provider verbatim."},
+            "project": _PROJECT_PROPERTY,
+            "duration": {
+                "type": "integer",
+                "description": "Seconds; must be a supported value.",
+            },
+            "resolution": {"type": "string"},
+            "aspect_ratio": {"type": "string"},
+            "generate_audio": {"type": "boolean"},
+            "seed": {"type": "integer"},
+            "first_frame_asset_id": {"type": "string"},
+            "last_frame_asset_id": {"type": "string"},
+            "input_reference_asset_ids": _ASSET_ID_LIST,
+        },
+        ["model", "prompt"],
+    ),
+    "get_job": _object_schema(
+        {
+            "generation_id": {"type": "string"},
+            "wait_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_WAIT_SECONDS,
+                "default": 0,
+                "description": (
+                    "Long-poll for up to this many seconds. 0 returns the "
+                    "current state immediately."
+                ),
+            },
+        },
+        ["generation_id"],
+    ),
+    "upload_asset": _object_schema(
+        {
+            "path": {
+                "type": "string",
+                "description": "Absolute or user-relative path to a local file on this host.",
+            },
+            "project": _PROJECT_PROPERTY,
+        },
+        ["path"],
+    ),
+    "list_media": _object_schema(
+        {
+            "project": {"type": "string"},
+            "kind": {"type": "string", "enum": ["image", "video"]},
+            "model": {"type": "string"},
+            "created_after": {"type": "string", "description": "ISO-8601 UTC, inclusive."},
+            "created_before": {"type": "string", "description": "ISO-8601 UTC, exclusive."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        }
+    ),
+    "get_media": _object_schema({"generation_id": {"type": "string"}}, ["generation_id"]),
+    "delete_media": _object_schema({"generation_id": {"type": "string"}}, ["generation_id"]),
+    "list_projects": _object_schema({}),
+    "create_project": _object_schema({"name": {"type": "string"}}, ["name"]),
+    "get_budget": _object_schema({}),
+}
+
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "list_models": (
+        "List available image and video models with their capability "
+        "constraints. Read this before generating: supported resolutions, "
+        "durations, aspect ratios and reference-image slots differ per model."
+    ),
+    "generate_image": (
+        "Generate one image synchronously and return the finished asset with "
+        "both its local filesystem path and its HTTP URL. Blocks until the "
+        "image exists. Batch generation is not supported."
+    ),
+    "generate_video": (
+        "Submit a video generation job and return its ID immediately. Does "
+        "NOT wait for the render; poll with get_job."
+    ),
+    "get_job": (
+        "Fetch a generation's current state, optionally long-polling for up "
+        "to wait_seconds. Returns the finished asset once the state is "
+        "COMPLETE."
+    ),
+    "upload_asset": (
+        "Ingest a local file into a project's uploads directory and return an "
+        "asset ID usable as an image reference or a video frame."
+    ),
+    "list_media": "Browse the library with optional project, kind, model and date filters.",
+    "get_media": "Full metadata for one generation, including its input lineage.",
+    "delete_media": "Delete a generation together with its files and thumbnails.",
+    "list_projects": "List projects. 'unsorted' always exists.",
+    "create_project": "Create a project and return its slug.",
+    "get_budget": (
+        "Provider-authoritative remaining credit plus local daily-cap status. "
+        "Amounts are strings or null; null means the cost is unknown, never zero."
+    ),
+}
+
+
+def build_tools() -> list[types.Tool]:
+    """The declared tool list, in specification order."""
+    return [
+        types.Tool(
+            name=name,
+            description=TOOL_DESCRIPTIONS[name],
+            inputSchema=TOOL_SCHEMAS[name],
+        )
+        for name in TOOL_NAMES
+    ]
+
+
+async def handle_list_tools() -> list[types.Tool]:
+    return build_tools()
