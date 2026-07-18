@@ -1,0 +1,64 @@
+# HiggsHole systemd service — example unit.
+#
+# Copy to /etc/systemd/system/higgshole.service and substitute the two
+# placeholders:
+#
+#   @USER@         the unprivileged service account, e.g. higgshole
+#   @INSTALL_DIR@  the checkout directory, e.g. /opt/higgshole
+#
+#   sed -e 's|@USER@|higgshole|g' -e 's|@INSTALL_DIR@|/opt/higgshole|g' \
+#       deploy/higgshole.service.example \
+#       | sudo tee /etc/systemd/system/higgshole.service
+#
+# See docs/deployment.md.
+
+[Unit]
+Description=HiggsHole media generation console
+Documentation=https://github.com/higgshole/higgshole
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=@USER@
+Group=@USER@
+WorkingDirectory=@INSTALL_DIR@
+
+# Optional: the leading '-' means the service still starts if the file is
+# absent, so a first boot does not fail before the operator has written it.
+EnvironmentFile=-/etc/higgshole/higgshole.env
+
+Environment=HIGGSHOLE_MEDIA_ROOT=/var/lib/higgshole/media
+Environment=HIGGSHOLE_DB_PATH=/var/lib/higgshole/state/higgshole.db
+Environment=HIGGSHOLE_BIND_HOST=127.0.0.1
+Environment=HIGGSHOLE_BIND_PORT=8077
+
+# Exactly ONE worker, deliberately. Video pollers are in-process asyncio
+# tasks: a second worker would reattach its own poller to the same job at
+# boot, downloading the result twice and double-counting the spend. The
+# reservation lock that enforces the daily cap is likewise process-local.
+ExecStart=@INSTALL_DIR@/.venv/bin/uvicorn --factory higgshole.web.app:create_app --host ${HIGGSHOLE_BIND_HOST} --port ${HIGGSHOLE_BIND_PORT} --workers 1
+
+Restart=always
+RestartSec=5
+
+# Hardening (spec section 9).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# ProtectSystem=strict makes the whole filesystem read-only; these are the
+# only two locations the service writes to.
+ReadWritePaths=/var/lib/higgshole/media /var/lib/higgshole/state
+
+[Install]
+WantedBy=multi-user.target
