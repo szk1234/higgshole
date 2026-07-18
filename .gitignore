@@ -1,0 +1,40 @@
+# --- secrets & local configuration -------------------------------------
+# Never commit API keys or machine-specific paths.
+.env
+.env.*
+!.env.example
+config.local.*
+*.local.toml
+secrets.*
+
+# --- runtime state ------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+var/
+data/
+media/
+
+# --- python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- editors / os -------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/
