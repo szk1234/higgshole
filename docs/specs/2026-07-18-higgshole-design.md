@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-18
 **Status:** Approved for planning
-**Revision:** 2 (post technical audit)
+**Revision:** 3 (post cross-plan audit)
 
 A self-hosted AI image and video generation console with a browsable media
 library, backed by the OpenRouter API, exposed to local AI agents over MCP.
@@ -633,11 +633,25 @@ Two verified hazards:
 2. **`BaseHTTPMiddleware` that buffers or rewrites `Content-Length` breaks
    ranges.**
 
-**Mechanism (not merely a requirement):** media is served from a **separate
-Starlette sub-application mounted** under the main app. Middleware is registered
-on the parent app only, so mounted routes are structurally exempt. §11 requires
-a regression test asserting a 206 response carries no `Content-Encoding`, so a
-future middleware addition cannot silently reintroduce the fault.
+**Mechanism (not merely a requirement):** the application subclass **overrides
+`__call__`** and dispatches requests whose path begins with a media prefix
+directly to the media handler **before** delegating to `super().__call__()`.
+Media responses therefore never enter the middleware stack at all.
+
+Mounting a sub-application was tested and found **insufficient**. On Starlette
+1.3.1 with FastAPI, `Starlette.__call__` delegates to `self.middleware_stack`,
+which wraps the entire router *including* mounts, so a mounted media app is not
+exempt. Measured against `GZipMiddleware` with a 206 partial-content response:
+
+```
+app.mount("/media", sub_app)  -> 206 | content-encoding: gzip   <- corrupted
+override __call__             -> 206 | content-encoding: None   <- clean
+```
+
+§11 requires a regression test asserting a 206 response carries no
+`Content-Encoding`, so a future middleware addition cannot silently reintroduce
+the fault. That test is only meaningful because the negative control — a plain
+mount — demonstrably fails it.
 
 ---
 
@@ -675,9 +689,13 @@ deliberate act, requiring `HIGGSHOLE_BIND_HOST` to be changed.
 ## 8. Configuration
 
 All settings are environment variables, readable from a `.env` file. Keys may
-alternatively be set through the UI, which persists them to the database; an
-environment value seeds the database on first run and is required for headless
-or MCP-only operation.
+alternatively be set through the UI, which persists them to the database. The
+database overlays the environment rather than being seeded from it: each key and
+the daily cap are resolved per request, taking the stored value when one is set
+and falling back to the environment otherwise. A value saved in the UI therefore
+takes effect immediately without a restart, and clearing it restores the
+environment value. An environment value remains required for headless or MCP-only
+operation, where there is no UI to set one.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -697,6 +715,11 @@ or MCP-only operation.
 | `HIGGSHOLE_CATALOG_TTL_HOURS` | `24` | Catalogue refresh interval |
 | `HIGGSHOLE_REFERENCE_TRANSPORT` | `data_uri` | Reference image transport (§2.8) |
 | `HIGGSHOLE_LIVE_TESTS` | unset | Enables the paid smoke test (§11) |
+| `HIGGSHOLE_API_BASE` | `http://127.0.0.1:8077` | REST API base URL used by the MCP server |
+
+`HIGGSHOLE_API_BASE` is read by the MCP client process to locate a *running*
+REST API, not by the server itself, and is therefore deliberately not part of
+`Settings`.
 
 A `.env.example` documenting all of the above ships with the repository.
 

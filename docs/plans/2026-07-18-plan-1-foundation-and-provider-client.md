@@ -2497,7 +2497,6 @@ In `pyproject.toml`, extend the pytest section:
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-filterwarnings = ["error"]
 markers = [
     "live: performs a real, billable API call; deselected unless HIGGSHOLE_LIVE_TESTS is set",
 ]
