@@ -16,10 +16,12 @@ dependencies = [
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
     "uvicorn>=0.30",
+    "mcp>=1.12,<2.0",
 ]
 
 [project.scripts]
 higgshole = "higgshole.web.app:run"
+higgshole-mcp = "higgshole.mcp_server:run"
 
 [project.optional-dependencies]
 dev = [
