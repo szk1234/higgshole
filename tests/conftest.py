@@ -32,3 +32,26 @@ def _forbid_real_network(request, monkeypatch):
 
     monkeypatch.setattr(socket.socket, "connect", _blocked)
     monkeypatch.setattr(socket, "create_connection", _blocked)
+
+
+@pytest.fixture
+def db():
+    """A migrated in-memory database, closed after the test."""
+    from higgshole.store.db import Database
+
+    database = Database.in_memory()
+    database.migrate()
+    try:
+        yield database
+    finally:
+        database.close()
+
+
+@pytest.fixture
+def media_paths(tmp_path):
+    """A media root under tmp_path, with the default project tree created."""
+    from higgshole.store.paths import MediaPaths
+
+    paths = MediaPaths(tmp_path / "media")
+    paths.ensure_project_tree("unsorted")
+    return paths
