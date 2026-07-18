@@ -3,7 +3,9 @@
 This is a standalone Starlette application rather than a set of routes on the
 main app. `web/app.py` dispatches to it BEFORE the parent's middleware stack
 runs, which is the structural guarantee behind spec section 6.3: no middleware
-anyone adds later can compress or re-length a 206 response.
+anyone adds later can compress or re-length a 206 response. The regression
+test in tests/web/test_media_middleware.py adds GZipMiddleware on purpose and
+proves media responses are still uncompressed.
 
 `FileResponse` implements HTTP Range natively — 206 with Content-Range, suffix
 ranges and 416 all come for free, so there is no custom byte-slicing code here
