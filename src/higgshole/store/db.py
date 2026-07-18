@@ -16,7 +16,7 @@ import json
 import os
 import sqlite3
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -917,3 +917,184 @@ class Database:
             (asset_id,),
         ).fetchall()
         return [self._generation(row) for row in rows]
+
+    # -- ledger (append-only) -------------------------------------------
+
+    @staticmethod
+    def _ledger(row: sqlite3.Row) -> LedgerRow:
+        return LedgerRow(
+            id=row["id"],
+            generation_id=row["generation_id"],
+            kind=LedgerKind(row["kind"]),
+            amount=Decimal(row["amount"]),
+            cost_known=bool(row["cost_known"]),
+            recorded_at=row["recorded_at"],
+        )
+
+    def append_ledger(
+        self,
+        *,
+        generation_id: str,
+        kind: LedgerKind,
+        amount: Decimal,
+        cost_known: bool,
+    ) -> LedgerRow:
+        """Append one signed row. The ONLY write path into spend_ledger.
+
+        The amount is stored as a Decimal literal in a TEXT column: SQLite's
+        REAL would round money, and the sum of a day's rows is the number the
+        spend cap is enforced against.
+        """
+        recorded_at = utc_now_iso()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO spend_ledger (generation_id, kind, amount,"
+                " cost_known, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    generation_id,
+                    LedgerKind(kind).value,
+                    str(amount),
+                    1 if cost_known else 0,
+                    recorded_at,
+                ),
+            )
+            row_id = cursor.lastrowid
+
+        return LedgerRow(
+            id=int(row_id),
+            generation_id=generation_id,
+            kind=LedgerKind(kind),
+            amount=amount,
+            cost_known=cost_known,
+            recorded_at=recorded_at,
+        )
+
+    def list_ledger_for_generation(self, gen_id: str) -> list[LedgerRow]:
+        rows = self._conn.execute(
+            "SELECT * FROM spend_ledger WHERE generation_id = ? ORDER BY id ASC",
+            (gen_id,),
+        ).fetchall()
+        return [self._ledger(row) for row in rows]
+
+    def list_ledger_between(self, *, start_iso: str, end_iso: str) -> list[LedgerRow]:
+        """Rows with start_iso <= recorded_at < end_iso.
+
+        Summing is the caller's job so that Decimal arithmetic never passes
+        through SQLite (spec 3.3).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM spend_ledger WHERE recorded_at >= ? AND recorded_at < ?"
+            " ORDER BY id ASC",
+            (start_iso, end_iso),
+        ).fetchall()
+        return [self._ledger(row) for row in rows]
+
+    # -- catalogue ------------------------------------------------------
+
+    @staticmethod
+    def _catalog(row: sqlite3.Row) -> CatalogRow:
+        return CatalogRow(
+            model_id=row["model_id"],
+            kind=GenerationKind(row["kind"]),
+            capabilities=json.loads(row["capabilities"]),
+            fetched_at=row["fetched_at"],
+        )
+
+    def upsert_catalog(
+        self,
+        *,
+        model_id: str,
+        kind: GenerationKind,
+        capabilities: dict[str, Any],
+        fetched_at: str,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO model_catalog (model_id, kind, capabilities, fetched_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(model_id, kind) DO UPDATE SET"
+                " capabilities = excluded.capabilities,"
+                " fetched_at = excluded.fetched_at",
+                (
+                    model_id,
+                    GenerationKind(kind).value,
+                    json.dumps(capabilities, sort_keys=True),
+                    fetched_at,
+                ),
+            )
+
+    def replace_catalog(
+        self,
+        kind: GenerationKind,
+        entries: Sequence[tuple[str, dict[str, Any]]],
+        *,
+        fetched_at: str,
+    ) -> None:
+        """Replace the whole catalogue for one kind in a single transaction.
+
+        A partially-fetched list must never half-overwrite a good cache, so
+        the delete and the inserts share one transaction (spec 4.2).
+        """
+        value = GenerationKind(kind).value
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM model_catalog WHERE kind = ?", (value,))
+            conn.executemany(
+                "INSERT INTO model_catalog (model_id, kind, capabilities, fetched_at)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    (model_id, value, json.dumps(caps, sort_keys=True), fetched_at)
+                    for model_id, caps in entries
+                ],
+            )
+
+    def list_catalog(self, kind: GenerationKind | None = None) -> list[CatalogRow]:
+        sql = "SELECT * FROM model_catalog"
+        params: list[Any] = []
+        if kind is not None:
+            sql += " WHERE kind = ?"
+            params.append(GenerationKind(kind).value)
+        rows = self._conn.execute(sql + " ORDER BY model_id ASC", params).fetchall()
+        return [self._catalog(row) for row in rows]
+
+    def get_catalog(self, model_id: str, kind: GenerationKind) -> CatalogRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM model_catalog WHERE model_id = ? AND kind = ?",
+            (model_id, GenerationKind(kind).value),
+        ).fetchone()
+        return self._catalog(row) if row else None
+
+    def catalog_fetched_at(self, kind: GenerationKind) -> str | None:
+        """Oldest fetched_at across the kind, or None when the cache is empty.
+
+        The oldest rather than the newest: freshness is only as good as the
+        least fresh entry the operator might be shown.
+        """
+        row = self._conn.execute(
+            "SELECT MIN(fetched_at) FROM model_catalog WHERE kind = ?",
+            (GenerationKind(kind).value,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def upsert_pricing(
+        self, *, model_id: str, pricing: list[dict[str, Any]], fetched_at: str
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO model_pricing (model_id, pricing, fetched_at)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(model_id) DO UPDATE SET"
+                " pricing = excluded.pricing, fetched_at = excluded.fetched_at",
+                (model_id, json.dumps(pricing), fetched_at),
+            )
+
+    def get_pricing(self, model_id: str) -> PricingRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM model_pricing WHERE model_id = ?", (model_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return PricingRow(
+            model_id=row["model_id"],
+            pricing=json.loads(row["pricing"]),
+            fetched_at=row["fetched_at"],
+        )
