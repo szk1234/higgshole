@@ -13,6 +13,8 @@ generation accepts should be reviewable, not inferred from annotations.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,6 +22,8 @@ from typing import Any
 
 import httpx
 import mcp.types as types
+from mcp.server.lowlevel import Server
+from mcp.server.stdio import stdio_server
 
 #: Where the REST API listens when nothing overrides it (spec section 8).
 DEFAULT_API_BASE: str = "http://127.0.0.1:8077"
@@ -619,3 +623,59 @@ TOOL_HANDLERS.update(
         "get_budget": tool_get_budget,
     }
 )
+
+
+#: The MCP server instance. Registration is written as an explicit call below
+#: each handler rather than as a decorator purely for readability — the SDK
+#: returns the handler unchanged either way, so both forms are equivalent.
+server: Server = Server("higgshole")
+
+server.list_tools()(handle_list_tools)
+
+
+def _json_block(payload: Any) -> list[types.TextContent]:
+    """Render a result as one pretty-printed JSON text block.
+
+    ``default=str`` is a backstop only; the API returns money as strings
+    already, and no value crossing this boundary should be a float.
+    """
+    return [
+        types.TextContent(
+            type="text", text=json.dumps(payload, indent=2, sort_keys=True, default=str)
+        )
+    ]
+
+
+async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
+    """Execute one tool call.
+
+    A fresh HTTP client is built per call and closed afterwards. A stdio
+    server handles few calls across a long-idle session, so a pooled
+    connection would more likely be stale than reused.
+
+    Failures are returned as a JSON error object rather than raised: an agent
+    can then branch on the stable code, whereas a protocol-level exception
+    reaches it only as prose.
+    """
+    api = HiggsHoleAPI(resolve_api_base())
+    try:
+        result = await dispatch(api, name, dict(arguments or {}))
+    except ToolError as exc:
+        return _json_block(exc.to_payload())
+    finally:
+        await api.aclose()
+    return _json_block(result)
+
+
+server.call_tool()(handle_call_tool)
+
+
+async def main() -> None:
+    """Serve over stdio until the client closes the stream."""
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+def run() -> None:
+    """Console-script entrypoint (``higgshole-mcp``)."""
+    asyncio.run(main())
