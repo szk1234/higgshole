@@ -56,6 +56,7 @@ name = "higgshole"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "httpx" },
     { name = "pillow" },
     { name = "pydantic" },
@@ -72,6 +73,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.4" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pillow", specifier = ">=10.3" },
     { name = "pydantic", specifier = ">=2.7" },

@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pillow>=10.3",
+    "anyio>=4.4",
 ]
 
 [project.optional-dependencies]
