@@ -12,9 +12,10 @@ SUBMITTED, RUNNING or DOWNLOADING, which is what makes boot-time reattachment
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -26,10 +27,16 @@ from higgshole.budget.estimator import (
     estimate_image_cost,
     estimate_video_cost,
 )
-from higgshole.budget.gate import BudgetGate, Reservation
+from higgshole.budget.gate import (
+    BudgetGate,
+    GateDecision,
+    GateRejection,
+    Reservation,
+)
 from higgshole.catalog.validation import (
     Severity,
     ValidationIssue,
+    has_hard_failure,
     validate_image_request,
     validate_video_request,
 )
@@ -41,6 +48,13 @@ from higgshole.jobs.references import (
     build_video_frame_images,
 )
 from higgshole.orclient.client import OpenRouterClient
+from higgshole.orclient.errors import (
+    IndeterminateError,
+    InsufficientCreditsError,
+    ModerationError,
+    OpenRouterError,
+    RateLimitError,
+)
 from higgshole.store.db import (
     AssetKind,
     Database,
@@ -375,6 +389,55 @@ class JobRunner:
             error_detail=detail,
         )
 
+    # -- gating and provider error classification --------------------------
+
+    #: Provider error type -> the reason recorded against the generation.
+    _ERROR_REASONS: tuple[tuple[type[OpenRouterError], ErrorReason], ...] = (
+        (IndeterminateError, ErrorReason.INDETERMINATE),
+        (ModerationError, ErrorReason.MODERATION),
+        (InsufficientCreditsError, ErrorReason.INSUFFICIENT_CREDITS),
+    )
+
+    @classmethod
+    def reason_for(cls, exc: OpenRouterError) -> ErrorReason:
+        for error_type, reason in cls._ERROR_REASONS:
+            if isinstance(exc, error_type):
+                return reason
+        return ErrorReason.PROVIDER_FAILED
+
+    @staticmethod
+    def _rejection_reason(rejection: GateRejection) -> ErrorReason:
+        if rejection.decision is GateDecision.IN_FLIGHT_LIMIT:
+            return ErrorReason.IN_FLIGHT_LIMIT
+        return ErrorReason.CAP_EXCEEDED
+
+    async def gate_or_reject(
+        self, gen_id: str, request: GenerationRequest
+    ) -> Reservation | GenerationOutcome:
+        """Estimate, then take the serialized budget gate.
+
+        A GateRejection is a normal result, not an error: it becomes REJECTED
+        with the matching reason and the provider is never called.
+        """
+        estimate = await self.estimate(request)
+        decision = await self.gate.acquire(generation_id=gen_id, estimate=estimate)
+        if isinstance(decision, GateRejection):
+            return await self.reject(
+                gen_id, self._rejection_reason(decision), decision.message
+            )
+        return decision
+
+    async def validate_or_reject(
+        self, gen_id: str, request: GenerationRequest
+    ) -> GenerationOutcome | None:
+        issues = await self.validate(request)
+        if not has_hard_failure(issues):
+            return None
+        detail = "; ".join(
+            issue.message for issue in issues if issue.severity is Severity.HARD
+        )
+        return await self.reject(gen_id, ErrorReason.VALIDATION, detail)
+
     # -- resolving stored inputs into provider payloads --------------------
 
     def _resolved_inputs(self, gen_id: str) -> list[tuple[Any, InputRole]]:
@@ -630,12 +693,219 @@ class JobRunner:
 
 
 class ImageJobRunner(JobRunner):
-    """PENDING -> GENERATING -> WRITING -> COMPLETE (spec section 4.3)."""
+    """PENDING -> GENERATING -> WRITING -> COMPLETE, with REJECTED and FAILED
+    branches (spec section 4.3). Synchronous end to end; no row it creates can
+    ever occupy SUBMITTED, RUNNING or DOWNLOADING.
+    """
 
     media_kind: MediaKind = "image"
 
+    async def run(self, request: GenerationRequest) -> GenerationOutcome:
+        """Validate, gate, dispatch and persist in one call.
+
+        A transport failure after the request is sent surfaces as
+        IndeterminateError and becomes FAILED/INDETERMINATE — never retried,
+        because POST /images is synchronous and non-idempotent (spec section
+        4.4). HTTP 429 is retried with backoff before dispatch is considered
+        to have occurred.
+        """
+        row = await self.create_pending(request)
+
+        rejected = await self.validate_or_reject(row.id, request)
+        if rejected is not None:
+            return rejected
+
+        gated = await self.gate_or_reject(row.id, request)
+        if isinstance(gated, GenerationOutcome):
+            return gated
+        reservation = gated
+
+        self._transition(row.id, GenerationKind.IMAGE, GenerationState.GENERATING)
+
+        references = self.input_references_for(row.id)
+        params = self.wire_params(request.params)
+
+        attempt = 0
+        while True:
+            try:
+                async with self.client_factory(self.media_kind) as client:
+                    result = await client.generate_image(
+                        model=request.model,
+                        prompt=request.prompt,
+                        input_references=references,
+                        **params,
+                    )
+                break
+            except RateLimitError as exc:
+                # Retryable: a 429 means the request was refused before the
+                # provider began work, so no charge can have occurred.
+                if attempt >= self.retry_policy.max_retries:
+                    return await self.finalise_failure(
+                        gen_id=row.id,
+                        reason=ErrorReason.PROVIDER_FAILED,
+                        detail=f"rate limited after {attempt + 1} attempts: {exc}",
+                        reservation=reservation,
+                    )
+                await self.clock.sleep(self.retry_policy.delay_for(attempt))
+                attempt += 1
+            except OpenRouterError as exc:
+                return await self.finalise_failure(
+                    gen_id=row.id,
+                    reason=self.reason_for(exc),
+                    detail=exc.message,
+                    reservation=reservation,
+                )
+
+        self._transition(row.id, GenerationKind.IMAGE, GenerationState.WRITING)
+
+        return await self.finalise_success(
+            gen_id=row.id,
+            data=result.data,
+            media_type=result.media_type,
+            cost=result.cost,
+            reservation=reservation,
+        )
+
 
 class VideoJobRunner(JobRunner):
-    """PENDING -> SUBMITTED -> RUNNING -> DOWNLOADING -> COMPLETE."""
+    """PENDING -> SUBMITTED -> RUNNING -> DOWNLOADING -> COMPLETE, with
+    REJECTED and FAILED branches (spec section 4.3).
+    """
 
     media_kind: MediaKind = "video"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._pollers: dict[str, asyncio.Task[GenerationOutcome]] = {}
+
+    async def submit(self, request: GenerationRequest) -> GenerationOutcome:
+        """Validate, gate, submit, persist the provider job ID, start polling.
+
+        Returns as soon as the ID is committed and never blocks on the render:
+        a multi-minute wait inside one call invites client timeouts
+        (spec section 6.2).
+        """
+        row = await self.create_pending(request)
+
+        rejected = await self.validate_or_reject(row.id, request)
+        if rejected is not None:
+            return rejected
+
+        gated = await self.gate_or_reject(row.id, request)
+        if isinstance(gated, GenerationOutcome):
+            return gated
+        reservation = gated
+
+        frame_images = self.frame_images_for(row.id)
+        # frame_images and input_references are distinct fields, and when both
+        # are supplied the provider honours frame_images and ignores the rest
+        # (spec section 2.3), so only one is ever sent.
+        references = [] if frame_images else self.input_references_for(row.id)
+        params = self.wire_params(request.params)
+
+        attempt = 0
+        while True:
+            try:
+                async with self.client_factory(self.media_kind) as client:
+                    job = await client.submit_video(
+                        model=request.model,
+                        prompt=request.prompt,
+                        frame_images=frame_images,
+                        input_references=references,
+                        **params,
+                    )
+                break
+            except RateLimitError as exc:
+                if attempt >= self.retry_policy.max_retries:
+                    return await self.finalise_failure(
+                        gen_id=row.id,
+                        reason=ErrorReason.PROVIDER_FAILED,
+                        detail=f"rate limited after {attempt + 1} attempts: {exc}",
+                        reservation=reservation,
+                    )
+                await self.clock.sleep(self.retry_policy.delay_for(attempt))
+                attempt += 1
+            except OpenRouterError as exc:
+                return await self.finalise_failure(
+                    gen_id=row.id,
+                    reason=self.reason_for(exc),
+                    detail=exc.message,
+                    reservation=reservation,
+                )
+
+        if job.generation_id:
+            self._provider_generation_ids[row.id] = job.generation_id
+
+        # Committed BEFORE polling begins, so a crash between here and the
+        # first poll still leaves a recoverable row (spec section 4.3).
+        self.db.set_provider_job_id(row.id, job.id)
+        self._transition(row.id, GenerationKind.VIDEO, GenerationState.SUBMITTED)
+
+        self.attach_poller(row.id, reservation=reservation)
+
+        return GenerationOutcome(
+            generation_id=row.id,
+            state=GenerationState.SUBMITTED,
+            file_path=None,
+            asset_id=None,
+            cost=None,
+            error_reason=None,
+            error_detail=None,
+        )
+
+    def attach_poller(
+        self, gen_id: str, *, reservation: Reservation | None
+    ) -> asyncio.Task[GenerationOutcome]:
+        """Spawn and register the polling task.
+
+        Idempotent per generation: a second call for a generation already
+        being polled returns the existing task, so boot reattachment can never
+        double-download a paid result.
+        """
+        existing = self._pollers.get(gen_id)
+        if existing is not None and not existing.done():
+            return existing
+
+        task = asyncio.create_task(
+            self.poll_until_terminal(gen_id, reservation=reservation),
+            name=f"higgshole-poll-{gen_id}",
+        )
+        self._pollers[gen_id] = task
+        task.add_done_callback(lambda done: self._forget(gen_id, done))
+        return task
+
+    def _forget(self, gen_id: str, task: asyncio.Task[GenerationOutcome]) -> None:
+        if self._pollers.get(gen_id) is task:
+            self._pollers.pop(gen_id, None)
+
+    def active_pollers(self) -> Mapping[str, asyncio.Task[GenerationOutcome]]:
+        return dict(self._pollers)
+
+    async def shutdown(self, *, timeout_s: float = 10.0) -> None:
+        """Cancel every poller.
+
+        Rows left in SUBMITTED or RUNNING are picked up by resume.py at the
+        next boot, which is why cancelling here is safe rather than lossy.
+        """
+        tasks = list(self._pollers.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout_s)
+        self._pollers.clear()
+
+    async def poll_until_terminal(
+        self, gen_id: str, *, reservation: Reservation | None
+    ) -> GenerationOutcome:
+        """Interim: poll while the provider reports a non-terminal status.
+
+        Task 7 replaces this with the full mapping, ceiling and download.
+        """
+        row = self.db.get_generation(gen_id)
+        while True:
+            async with self.client_factory(self.media_kind) as client:
+                job = await client.get_video_job(row.provider_job_id)
+            state, _reason = map_provider_status(job.status)
+            if state is not GenerationState.RUNNING:
+                raise NotImplementedError("terminal handling arrives in Task 7")
+            await self.clock.sleep(self.settings.poll_interval_seconds)
