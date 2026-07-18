@@ -272,6 +272,9 @@ def create_app(
     paths = MediaPaths.from_settings(resolved)
     app.media_app = create_media_app(paths, database)
 
+    from higgshole.web import api  # imported here to avoid a circular import
+
+    app.include_router(api.router)
     app.include_router(sse.router)
     return app
 
