@@ -15,7 +15,17 @@ from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 from pydantic import BaseModel
 
 from higgshole.budget.estimator import (
@@ -25,7 +35,9 @@ from higgshole.budget.estimator import (
 )
 from higgshole.budget.ledger import BudgetStatus
 from higgshole.catalog.validation import Severity, ValidationIssue, has_hard_failure
+from higgshole.jobs.references import ReferenceTransport, video_references_supported
 from higgshole.jobs.runner import GenerationOutcome, GenerationRequest
+from higgshole.orclient.client import looks_like_openrouter_key
 from higgshole.orclient.errors import (
     AuthError,
     IndeterminateError,
@@ -49,7 +61,22 @@ from higgshole.store.db import (
     InputRole,
     MediaFilter,
 )
-from higgshole.web.app import AppState, get_state
+from higgshole.store.files import (
+    SidecarError,
+    atomic_write_bytes,
+    delete_quietly,
+    iter_sidecars,
+    read_sidecar,
+)
+from higgshole.store.metadata import (
+    UnsupportedMediaError,
+    extension_for,
+    ffmpeg_available,
+    mime_for,
+    probe_media,
+)
+from higgshole.store.paths import new_id
+from higgshole.web.app import AppState, get_state, resolve_daily_cap
 from higgshole.web.media import media_url_for, poster_url_for, thumb_url_for
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -754,3 +781,323 @@ async def get_job(
         row = refreshed
 
     return generation_out(state, row)
+
+
+#: 256 MiB. Large enough for any reference image or short clip an operator
+#: would ingest, small enough that a mistake cannot fill the media root.
+MAX_UPLOAD_BYTES: int = 256 * 1024 * 1024
+
+_KEY_SETTINGS = (
+    "openrouter_api_key",
+    "openrouter_api_key_image",
+    "openrouter_api_key_video",
+)
+
+
+class SettingsIn(BaseModel):
+    openrouter_api_key: str | None = None
+    openrouter_api_key_image: str | None = None
+    openrouter_api_key_video: str | None = None
+    daily_cap_usd: str | None = None
+    favourite_models: list[str] | None = None
+
+
+class SettingsOut(BaseModel):
+    """Keys are write-only: only a masked suffix is ever returned."""
+
+    openrouter_api_key_masked: str | None
+    openrouter_api_key_image_masked: str | None
+    openrouter_api_key_video_masked: str | None
+    daily_cap_usd: str | None
+    favourite_models: list[str]
+    catalog: CatalogStatusOut
+    ffmpeg_available: bool
+    reference_transport: str
+    video_references_supported: bool
+
+
+class RescanOut(BaseModel):
+    projects_created: int
+    generations_created: int
+    assets_created: int
+    sidecars_read: int
+    errors: list[str]
+
+
+@router.post("/uploads", response_model=AssetOut, status_code=201)
+async def upload_asset(
+    file: UploadFile = File(...),
+    project: str = Form(default="unsorted"),
+    state: AppState = Depends(get_state),
+) -> AssetOut:
+    """Ingest a local file so it can be used as a generation reference.
+
+    Without this an agent holding an image on disk has no way to reference it
+    (spec section 6.2).
+    """
+    target_project = _require_project(state, project)
+    original_name = file.filename or "upload"
+
+    try:
+        mime_type = mime_for(original_name)
+        extension = extension_for(mime_type)
+    except UnsupportedMediaError as exc:
+        raise error_response(
+            415, "unsupported_media_type", f"{original_name!r} is not a supported type."
+        ) from exc
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise error_response(
+            413,
+            "upload_too_large",
+            f"{len(data)} bytes exceeds the {MAX_UPLOAD_BYTES}-byte limit.",
+        )
+
+    asset_id = new_id()
+    allocated = state.paths.allocate_upload(
+        project_slug=target_project.slug,
+        asset_id=asset_id,
+        original_name=original_name,
+        ext=extension,
+    )
+    atomic_write_bytes(allocated.media_path, data)
+
+    metadata = probe_media(allocated.media_path)
+    asset = state.db.create_asset(
+        kind=AssetKind.UPLOAD,
+        file_path=allocated.relative_media_path.as_posix(),
+        mime_type=metadata.mime_type,
+        bytes_=metadata.bytes,
+        width=metadata.width,
+        height=metadata.height,
+        duration_s=metadata.duration_s,
+        asset_id=asset_id,
+    )
+    return _asset_out(state, asset)
+
+
+@router.get("/media", response_model=MediaListOut)
+async def list_media(
+    project: str | None = Query(default=None),
+    kind: GenerationKind | None = Query(default=None),
+    model: str | None = Query(default=None),
+    created_after: str | None = Query(default=None),
+    created_before: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    state: AppState = Depends(get_state),
+) -> MediaListOut:
+    filters = MediaFilter(
+        project_slug=project,
+        kind=kind,
+        model=model,
+        created_after=created_after,
+        created_before=created_before,
+        limit=limit,
+        offset=offset,
+    )
+    rows = state.db.list_generations(filters)
+    return MediaListOut(
+        items=[generation_out(state, row) for row in rows],
+        total=state.db.count_generations(filters),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/media/{gen_id}", response_model=GenerationOut)
+async def get_media(gen_id: str, state: AppState = Depends(get_state)) -> GenerationOut:
+    row = state.db.get_generation(gen_id)
+    if row is None:
+        raise error_response(404, "generation_not_found", f"No generation {gen_id!r}.")
+    return generation_out(state, row)
+
+
+@router.delete("/media/{gen_id}", status_code=204)
+async def delete_media(gen_id: str, state: AppState = Depends(get_state)) -> Response:
+    """Remove a generation, its files and its thumbnails.
+
+    The database returns the paths and this handler unlinks them: `store/`
+    never touches the disk on behalf of a request.
+    """
+    if state.db.get_generation(gen_id) is None:
+        raise error_response(404, "generation_not_found", f"No generation {gen_id!r}.")
+
+    for relative in state.db.delete_generation(gen_id):
+        absolute = state.paths.root / relative
+        delete_quietly(absolute)
+        delete_quietly(state.paths.sidecar_path(absolute))
+
+    return Response(status_code=204)
+
+
+def _settings_out(state: AppState) -> SettingsOut:
+    stored = state.db.all_settings()
+    favourites_raw = stored.get(FAVOURITES_SETTING)
+    try:
+        favourites = list(json.loads(favourites_raw)) if favourites_raw else []
+    except (ValueError, TypeError):
+        favourites = []
+
+    status = state.catalog.status()
+    return SettingsOut(
+        openrouter_api_key_masked=mask_key(stored.get("openrouter_api_key")),
+        openrouter_api_key_image_masked=mask_key(stored.get("openrouter_api_key_image")),
+        openrouter_api_key_video_masked=mask_key(stored.get("openrouter_api_key_video")),
+        daily_cap_usd=stored.get("daily_cap_usd"),
+        favourite_models=favourites,
+        catalog=CatalogStatusOut(
+            image_fetched_at=status.image_fetched_at,
+            video_fetched_at=status.video_fetched_at,
+            is_stale=status.is_stale,
+            last_error=status.last_error,
+        ),
+        ffmpeg_available=ffmpeg_available(),
+        reference_transport=state.settings.reference_transport,
+        video_references_supported=video_references_supported(
+            ReferenceTransport(state.settings.reference_transport)
+        ),
+    )
+
+
+@router.get("/settings", response_model=SettingsOut)
+async def get_settings_view(state: AppState = Depends(get_state)) -> SettingsOut:
+    return _settings_out(state)
+
+
+@router.put("/settings", response_model=SettingsOut)
+async def update_settings(
+    body: SettingsIn, state: AppState = Depends(get_state)
+) -> SettingsOut:
+    """Persist settings. Keys are validated for shape before being stored."""
+    for field in _KEY_SETTINGS:
+        value = getattr(body, field)
+        if value is None:
+            continue
+        if value == "":
+            state.db.delete_setting(field)
+            continue
+        if not looks_like_openrouter_key(value):
+            raise error_response(
+                400,
+                "validation_failed",
+                "That does not look like an OpenRouter key; it must begin "
+                "'sk-or-v1-'.",
+            )
+        state.db.set_setting(field, value.strip())
+
+    if body.daily_cap_usd is not None:
+        if body.daily_cap_usd == "":
+            state.db.delete_setting("daily_cap_usd")
+        else:
+            try:
+                Decimal(body.daily_cap_usd)
+            except ArithmeticError as exc:
+                raise error_response(
+                    400, "validation_failed", "The daily cap must be a decimal amount."
+                ) from exc
+            state.db.set_setting("daily_cap_usd", body.daily_cap_usd)
+
+        # The runners hold this gate instance, so the cap is applied to the
+        # live object. Rebinding state.gate would leave them on the old one,
+        # and waiting for a restart would leave the saved cap unenforced.
+        state.gate.set_daily_cap(resolve_daily_cap(state.db, state.settings))
+
+    if body.favourite_models is not None:
+        state.db.set_setting(FAVOURITES_SETTING, json.dumps(body.favourite_models))
+
+    # A rotated key must not be masked by a cached provider figure.
+    state.key_status_cached = None
+    return _settings_out(state)
+
+
+@router.post("/settings/catalog/refresh", response_model=CatalogStatusOut)
+async def refresh_catalog(state: AppState = Depends(get_state)) -> CatalogStatusOut:
+    status = await state.catalog.refresh(force=True)
+    return CatalogStatusOut(
+        image_fetched_at=status.image_fetched_at,
+        video_fetched_at=status.video_fetched_at,
+        is_stale=status.is_stale,
+        last_error=status.last_error,
+    )
+
+
+def rescan_library(state: AppState) -> RescanOut:
+    """Rebuild index rows from the sidecars on disk (spec section 5.3).
+
+    Only `projects`, `generations`, `assets` and `generation_inputs` are
+    recoverable. `spend_ledger` and `settings` exist nowhere on disk, so a
+    rescan is not a substitute for backing up the state directory.
+    """
+    projects_created = generations_created = assets_created = sidecars_read = 0
+    errors: list[str] = []
+
+    for sidecar_path in iter_sidecars(state.paths.root):
+        try:
+            payload = read_sidecar(sidecar_path)
+        except SidecarError as exc:
+            errors.append(f"{sidecar_path.name}: {exc}")
+            continue
+
+        sidecars_read += 1
+        try:
+            slug = payload["project_slug"]
+            project = state.db.get_project_by_slug(slug)
+            if project is None:
+                project = state.db.create_project(name=slug, slug=slug)
+                projects_created += 1
+
+            gen_id = payload["id"]
+            if state.db.get_generation(gen_id) is None:
+                state.db.create_generation(
+                    project_id=project.id,
+                    kind=GenerationKind(payload["kind"]),
+                    model=payload["model"],
+                    prompt=payload["prompt"],
+                    params=payload["params"],
+                    state=GenerationState.COMPLETE,
+                    gen_id=gen_id,
+                )
+                generations_created += 1
+
+            media = payload["media"]
+            relative = media["relative_path"]
+            state.db.set_generation_file(gen_id, relative)
+            if state.db.get_asset_by_path(relative) is None:
+                state.db.create_asset(
+                    kind=AssetKind.OUTPUT,
+                    file_path=relative,
+                    mime_type=media["mime_type"],
+                    bytes_=media["bytes"],
+                    generation_id=gen_id,
+                    width=media["width"],
+                    height=media["height"],
+                    duration_s=media["duration_s"],
+                )
+                assets_created += 1
+
+            for entry in payload["inputs"]:
+                asset = state.db.get_asset_by_path(entry["relative_path"])
+                if asset is not None:
+                    state.db.add_generation_input(
+                        generation_id=gen_id,
+                        asset_id=asset.id,
+                        role=InputRole(entry["role"]),
+                        position=entry["position"],
+                    )
+        except (KeyError, ValueError) as exc:
+            errors.append(f"{sidecar_path.name}: {exc}")
+
+    return RescanOut(
+        projects_created=projects_created,
+        generations_created=generations_created,
+        assets_created=assets_created,
+        sidecars_read=sidecars_read,
+        errors=errors,
+    )
+
+
+@router.post("/settings/rescan", response_model=RescanOut)
+async def rescan(state: AppState = Depends(get_state)) -> RescanOut:
+    return rescan_library(state)

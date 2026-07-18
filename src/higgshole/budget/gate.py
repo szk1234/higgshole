@@ -82,6 +82,16 @@ class BudgetGate:
     def cap(self) -> Decimal | None:
         return self._cap
 
+    def set_daily_cap(self, cap: Decimal | None) -> None:
+        """Replace the cap without rebuilding the gate.
+
+        The cap may be saved through the UI (spec section 8) while runners
+        already hold this instance, so it has to be mutable in place. The
+        assignment is atomic and `acquire` reads it under the lock, so a
+        concurrent reservation sees either the old cap or the new one.
+        """
+        self._cap = cap
+
     @property
     def cap_is_set(self) -> bool:
         """Passed to validate_image_request(daily_cap_set=...).
