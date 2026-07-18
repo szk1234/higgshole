@@ -14,8 +14,9 @@ import re
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
+from typing import Any
 
-from higgshole.orclient.types import VideoModel
+from higgshole.orclient.types import ImageModel, VideoModel
 
 #: x-ai/grok-imagine-video prefixes its SKU keys with this. Reading '7' as
 #: dollars is a 100x overestimate (spec 3.1 item 2).
@@ -270,3 +271,118 @@ def reservation_amount(
     if estimate.amount is not None:
         return estimate.amount, True
     return max_job_cost_usd, False
+
+
+# -- image pricing --------------------------------------------------------
+
+#: Line items describing the generated image itself.
+_OUTPUT_BILLABLES = frozenset({"output_image", "image", "output"})
+
+#: Line items charged per supplied reference image.
+_INPUT_BILLABLES = frozenset({"input_reference", "input_image"})
+
+_PER_MEGAPIXEL = Decimal(1_000_000)
+
+
+def _line_unit(item: dict[str, Any]) -> str:
+    return str(item.get("unit") or "").strip().lower()
+
+
+def _line_cost(item: dict[str, Any]) -> Decimal:
+    return Decimal(str(item.get("cost_usd")))
+
+
+def estimate_image_cost(
+    model: ImageModel,
+    pricing: list[dict[str, Any]],
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    quality: str | None = None,
+    reference_count: int = 0,
+) -> Estimate:
+    """Sum the matching line items from /images/models/{id}/endpoints.
+
+    Input-side items are material and must be included: input_reference on
+    riverflow-v2-pro costs $0.20 each, so five references add $1.00 before a
+    single pixel is generated (spec 3.2).
+    """
+    if not pricing:
+        return _unavailable(
+            EstimateUnavailable.NO_PRICING_DATA,
+            f"no cached pricing for {model.id}.",
+        )
+
+    outputs = [
+        item for item in pricing if str(item.get("billable")) in _OUTPUT_BILLABLES
+    ]
+    if not outputs:
+        return _unavailable(
+            EstimateUnavailable.NO_MATCHING_SKU,
+            f"{model.id} publishes no output line item.",
+        )
+
+    if any(_line_unit(item) in TOKEN_UNITS for item in outputs):
+        return _unavailable(
+            EstimateUnavailable.TOKEN_PRICED,
+            f"{model.id} is billed per token, and no tokens-per-image table is "
+            "published, so no cost can be computed before dispatch.",
+        )
+
+    variants = [item for item in outputs if item.get("variant")]
+    if quality is not None and variants:
+        matched = [item for item in variants if str(item["variant"]) == quality]
+        if not matched:
+            return _unavailable(
+                EstimateUnavailable.NO_MATCHING_SKU,
+                f"{model.id} publishes no line item for quality={quality}.",
+            )
+        chosen = matched[0]
+    elif len(outputs) == 1:
+        chosen = outputs[0]
+    else:
+        return _unavailable(
+            EstimateUnavailable.AMBIGUOUS_AXES,
+            f"{model.id} publishes several output line items and no quality was "
+            "given to choose between them.",
+        )
+
+    unit = _line_unit(chosen)
+    if unit == "image":
+        total = _line_cost(chosen)
+    elif unit == "megapixel":
+        if width is None or height is None:
+            return _unavailable(
+                EstimateUnavailable.MISSING_AXIS,
+                f"{model.id} is priced per megapixel, but no output dimensions "
+                "were supplied.",
+            )
+        total = _line_cost(chosen) * (Decimal(width * height) / _PER_MEGAPIXEL)
+    else:
+        return _unavailable(
+            EstimateUnavailable.UNKNOWN_UNIT,
+            f"{model.id} prices its output in an unrecognised unit: {unit}.",
+        )
+
+    if reference_count:
+        for item in pricing:
+            if str(item.get("billable")) not in _INPUT_BILLABLES:
+                continue
+            if _line_unit(item) in TOKEN_UNITS:
+                return _unavailable(
+                    EstimateUnavailable.TOKEN_PRICED,
+                    f"{model.id} bills reference images per token, which cannot "
+                    "be converted before dispatch.",
+                )
+            total += _line_cost(item) * reference_count
+
+    return Estimate(
+        amount=_quantise(total),
+        reason=None,
+        detail=(
+            f"{chosen.get('billable')} at {chosen.get('cost_usd')} per {unit}"
+            + (f" plus {reference_count} reference(s)" if reference_count else "")
+            + "."
+        ),
+        sku_key=str(chosen.get("billable")),
+    )
