@@ -55,6 +55,7 @@ from higgshole.orclient.errors import (
     OpenRouterError,
     RateLimitError,
 )
+from higgshole.orclient.types import VideoJob
 from higgshole.store.db import (
     AssetKind,
     Database,
@@ -897,15 +898,131 @@ class VideoJobRunner(JobRunner):
     async def poll_until_terminal(
         self, gen_id: str, *, reservation: Reservation | None
     ) -> GenerationOutcome:
-        """Interim: poll while the provider reports a non-terminal status.
+        """Poll every settings.poll_interval_seconds until terminal or the
+        wall-clock ceiling.
 
-        Task 7 replaces this with the full mapping, ceiling and download.
+        Status mapping (spec section 4.3):
+          pending, in_progress -> RUNNING, keep polling
+          completed            -> DOWNLOADING then COMPLETE, download at once
+          failed               -> FAILED / PROVIDER_FAILED
+          cancelled            -> FAILED / PROVIDER_CANCELLED
+          expired              -> FAILED / PROVIDER_EXPIRED
+          unrecognised         -> RUNNING, keep polling (spec section 2.4)
+
+        Exceeding job_timeout_minutes is FAILED / TIMEOUT with the reservation
+        reversed.
         """
         row = self.db.get_generation(gen_id)
+        job_id = row.provider_job_id
+        if job_id is None:
+            return await self.finalise_failure(
+                gen_id=gen_id,
+                reason=ErrorReason.INDETERMINATE,
+                detail="no provider job id was recorded for this generation.",
+                reservation=reservation,
+            )
+
+        timeout_s = self.settings.job_timeout_minutes * 60
+        deadline = self.clock.monotonic() + timeout_s
+        announced_running = row.state is GenerationState.RUNNING
+        attempt = 0
+
         while True:
-            async with self.client_factory(self.media_kind) as client:
-                job = await client.get_video_job(row.provider_job_id)
-            state, _reason = map_provider_status(job.status)
-            if state is not GenerationState.RUNNING:
-                raise NotImplementedError("terminal handling arrives in Task 7")
-            await self.clock.sleep(self.settings.poll_interval_seconds)
+            if self.clock.monotonic() >= deadline:
+                return await self.finalise_failure(
+                    gen_id=gen_id,
+                    reason=ErrorReason.TIMEOUT,
+                    detail=(
+                        f"job {job_id} was still running after "
+                        f"{self.settings.job_timeout_minutes} minutes."
+                    ),
+                    reservation=reservation,
+                )
+
+            try:
+                async with self.client_factory(self.media_kind) as client:
+                    job = await client.get_video_job(job_id)
+            except OpenRouterError as exc:
+                # Polling is an idempotent GET and therefore freely retryable
+                # (spec section 4.4).
+                if attempt >= self.retry_policy.max_retries:
+                    return await self.finalise_failure(
+                        gen_id=gen_id,
+                        reason=ErrorReason.PROVIDER_FAILED,
+                        detail=f"polling failed repeatedly: {exc}",
+                        reservation=reservation,
+                    )
+                attempt += 1
+                await self.clock.sleep(self.retry_policy.delay_for(attempt))
+                continue
+
+            attempt = 0
+            state, reason = map_provider_status(job.status)
+
+            if state is GenerationState.RUNNING:
+                if not announced_running:
+                    self._transition(
+                        gen_id, GenerationKind.VIDEO, GenerationState.RUNNING
+                    )
+                    announced_running = True
+                await self.clock.sleep(self.settings.poll_interval_seconds)
+                continue
+
+            if state is GenerationState.DOWNLOADING:
+                return await self.download_and_finalise(
+                    gen_id, job, reservation=reservation
+                )
+
+            return await self.finalise_failure(
+                gen_id=gen_id,
+                reason=reason or ErrorReason.PROVIDER_FAILED,
+                detail=job.error or f"provider reported status {job.status!r}.",
+                reservation=reservation,
+            )
+
+    async def download_and_finalise(
+        self,
+        gen_id: str,
+        job: VideoJob,
+        *,
+        reservation: Reservation | None,
+    ) -> GenerationOutcome:
+        """Download immediately within the same task that observed `completed`.
+
+        OpenRouter proxies from the upstream provider and publishes no
+        retention window, so a result URL is never persisted as a durable
+        reference (spec section 2.5). A 502 is retried with backoff up to
+        settings.max_retries, then FAILED / DOWNLOAD_FAILED.
+        """
+        if job.generation_id:
+            self._provider_generation_ids[gen_id] = job.generation_id
+
+        self._transition(gen_id, GenerationKind.VIDEO, GenerationState.DOWNLOADING)
+
+        attempt = 0
+        while True:
+            try:
+                async with self.client_factory(self.media_kind) as client:
+                    data = await client.download_video(job.id)
+                break
+            except OpenRouterError as exc:
+                if attempt >= self.retry_policy.max_retries:
+                    return await self.finalise_failure(
+                        gen_id=gen_id,
+                        reason=ErrorReason.DOWNLOAD_FAILED,
+                        detail=(
+                            f"download failed after {attempt + 1} attempts: {exc}. "
+                            "The provider's retention window may have lapsed."
+                        ),
+                        reservation=reservation,
+                    )
+                attempt += 1
+                await self.clock.sleep(self.retry_policy.delay_for(attempt))
+
+        return await self.finalise_success(
+            gen_id=gen_id,
+            data=data,
+            media_type="video/mp4",
+            cost=job.cost,
+            reservation=reservation,
+        )
