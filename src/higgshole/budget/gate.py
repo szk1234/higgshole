@@ -15,7 +15,7 @@ from enum import StrEnum
 
 from higgshole.config import Settings
 from higgshole.orclient.types import KeyStatus
-from higgshole.store.db import TERMINAL_STATES, Database
+from higgshole.store.db import Database
 
 from .estimator import Estimate, reservation_amount
 from .ledger import BudgetStatus, Ledger
@@ -91,19 +91,6 @@ class BudgetGate:
         """
         return self._cap is not None
 
-    def _in_flight_excluding(self, generation_id: str) -> int:
-        """In-flight count that does not include the row being gated.
-
-        The generation is inserted as PENDING before the gate runs, so it is
-        already counted; subtracting it here keeps max_in_flight=3 meaning
-        three concurrent jobs rather than two.
-        """
-        count = self._db.count_in_flight()
-        own = self._db.get_generation(generation_id)
-        if own is not None and own.state not in TERMINAL_STATES:
-            count -= 1
-        return count
-
     async def acquire(
         self, *, generation_id: str, estimate: Estimate
     ) -> Reservation | GateRejection:
@@ -120,7 +107,11 @@ class BudgetGate:
             day = self._ledger.spend_for_day()
             remaining = None if self._cap is None else self._cap - day.total
 
-            in_flight = self._in_flight_excluding(generation_id)
+            # Excluded in SQL, not subtracted afterwards: exactly one exclusion
+            # happens, so max_in_flight=3 still means three concurrent jobs.
+            in_flight = self._db.count_in_flight(
+                exclude_generation_id=generation_id
+            )
             if in_flight >= self._max_in_flight:
                 return GateRejection(
                     decision=GateDecision.IN_FLIGHT_LIMIT,

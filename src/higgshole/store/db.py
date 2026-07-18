@@ -735,17 +735,24 @@ class Database:
         rows = self._conn.execute(sql + " ORDER BY created_at ASC", params).fetchall()
         return [self._generation(row) for row in rows]
 
-    def count_in_flight(self) -> int:
+    def count_in_flight(self, exclude_generation_id: str | None = None) -> int:
         """Generations in any non-terminal state.
 
-        Read inside the budget gate's lock (spec 3.3).
+        Read inside the budget gate's lock (spec 3.3). The gate passes the
+        generation it is currently deciding on, because that row is already
+        inserted in PENDING — a job must not count itself towards the ceiling,
+        and with concurrent submissions it would otherwise see every other
+        pending request and refuse them all.
         """
         terminal = [state.value for state in sorted(TERMINAL_STATES)]
         placeholders = ", ".join("?" for _ in terminal)
-        return self._conn.execute(
-            f"SELECT COUNT(*) FROM generations WHERE state NOT IN ({placeholders})",
-            terminal,
-        ).fetchone()[0]
+        sql = f"SELECT COUNT(*) FROM generations WHERE state NOT IN ({placeholders})"
+        parameters: list[Any] = list(terminal)
+        if exclude_generation_id is not None:
+            sql += " AND id != ?"
+            parameters.append(exclude_generation_id)
+
+        return self._conn.execute(sql, parameters).fetchone()[0]
 
     def delete_generation(self, gen_id: str) -> list[str]:
         """Delete the row and its assets, returning the paths to unlink.
