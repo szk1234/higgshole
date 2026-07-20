@@ -34,18 +34,31 @@ pytestmark = [
 
 #: Refuse to submit anything estimated above this. A guard against a
 #: catalogue change silently turning a $0.30 test into a $30 one.
-LIVE_COST_CEILING_USD = Decimal("1.00")
+LIVE_COST_CEILING_USD = Decimal("0.50")
 
 POLL_INTERVAL_S = 10.0
 POLL_CEILING_S = 600.0
 
 
-def _tiny_png_data_uri() -> str:
-    """An 8x8 solid PNG as a data URI — small enough to be uncontroversial."""
+#: Providers impose a minimum reference-image resolution. Measured against
+#: alibaba/wan-2.7 on 2026-07-20, which rejected an 8x8 PNG with
+#: "image resolution must be at least 240x240, got 8x8". 256 clears that with
+#: a little headroom while still encoding to a couple of hundred bytes.
+_REFERENCE_EDGE_PX = 256
+
+
+def _reference_png_data_uri() -> str:
+    """A solid PNG as a data URI, large enough for providers to accept.
+
+    Solid colour compresses to a few hundred bytes, so the data URI stays
+    small despite the pixel dimensions.
+    """
     from PIL import Image
 
     buffer = io.BytesIO()
-    Image.new("RGB", (8, 8), (32, 64, 128)).save(buffer, format="PNG")
+    Image.new(
+        "RGB", (_REFERENCE_EDGE_PX, _REFERENCE_EDGE_PX), (32, 64, 128)
+    ).save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode()
     return f"data:image/png;base64,{encoded}"
 
@@ -106,7 +119,7 @@ async def test_video_frame_images_accept_a_base64_data_uri():
         job = await client.submit_video(
             model=model.id,
             prompt="a slow gentle push in on a plain coloured surface",
-            frame_images=[(_tiny_png_data_uri(), "first_frame")],
+            frame_images=[(_reference_png_data_uri(), "first_frame")],
             duration=duration,
         )
         print(f"LIVE: accepted at submit time, job {job.id}")

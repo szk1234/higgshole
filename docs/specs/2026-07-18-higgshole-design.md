@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-18
 **Status:** Approved for planning
-**Revision:** 3 (post cross-plan audit)
+**Revision:** 4 (post live verification)
 
 A self-hosted AI image and video generation console with a browsable media
 library, backed by the OpenRouter API, exposed to local AI agents over MCP.
@@ -205,36 +205,48 @@ absent from a model's declared capability list but **present in its
 A value absent from **both** is treated as *hard invalid* and rejected before
 dispatch.
 
-### 2.8 Reference image transport — open question
+### 2.8 Reference image transport — RESOLVED 2026-07-20
 
 `FrameImage` extends `ContentPartImage`, whose `url` field is an unconstrained
 string [verified]. The image API documents this shared type as accepting
-*"base64 data URLs or HTTP(S) URLs"*, and image references via data URI are
-confirmed working.
+*"base64 data URLs or HTTP(S) URLs"*.
 
-**Whether video providers accept data URIs is unknown.** The video guide is
-silent on the matter: it says only *"ensure they are high quality and
-relevant"* and *"check that any reference images are accessible and in
-supported formats"*. It does **not** state that providers fetch server-side, and
-the word "public" does not appear in it. Earlier drafts of this document
-asserted otherwise; that assertion was unsupported and has been removed.
+**Video providers accept base64 data URIs in `frame_images`** [verified by live
+generation]. This was the design's largest open question, because a service on
+a private network cannot serve a URL an upstream provider could reach.
 
-So: schema-level acceptance is near-certain; runtime acceptance is untested.
-This matters because a service on a private network cannot serve a URL an
-upstream provider could reach.
+Measured against `alibaba/wan-2.7` on 2026-07-20: a 256×256 solid PNG supplied
+as a `data:image/png;base64,…` first frame was accepted at submit and the job
+reached `completed`. No tunnel, no object store, no public exposure.
 
-**Design response.** Reference transport is a single configurable strategy,
-`HIGGSHOLE_REFERENCE_TRANSPORT`, defaulting to `data_uri`. Resolution of open
-item §12.1 determines the outcome:
+**A prior attempt with an 8×8 PNG failed**, and the failure is the strongest
+evidence available that the transport works:
 
-- If data URIs work → image-to-video works with no further design.
-- If they do not → **image-to-video is deferred**, and the UI disables video
-  reference slots with an explanatory message. Image-to-image is unaffected.
+```
+image resolution must be at least 240x240, got 8x8
+```
 
-A public-URL transport mode is **explicitly not designed here.** Making local
-files provider-reachable requires a tunnel or object store, contradicts the
-trusted-network premise, and would need its own lifetime and revocation design.
-It is out of scope unless open item §12.1 forces the question.
+The provider could not have measured the dimensions without decoding the data
+URI. Rejection was on image size, never on transport.
+
+**Consequence:** `HIGGSHOLE_REFERENCE_TRANSPORT` stays at `data_uri` and
+image-to-video is fully supported. A public-URL transport mode is **not
+designed and not needed**; it would require a tunnel or object store and
+contradict the trusted-network premise.
+
+**Reference images must be at least 240×240** [verified]. The minimum is
+per-provider and not exposed in the catalogue, so it cannot be validated from
+capability data. Smaller references are rejected at submit rather than silently
+resized. Uploads below this should be flagged in the UI.
+
+Two further observations from the same run:
+
+- **Failed generations are not charged** [verified]. The 8×8 rejection cost
+  $0.00, confirming OpenRouter's all-or-nothing billing claim.
+- **`GET /api/v1/key` lags.** Immediately after a job reported `cost 0.5`, the
+  key endpoint still returned `usage: 0` and `limit_remaining: 1`. It is
+  authoritative but eventually consistent, which is why the local ledger — not
+  the key endpoint — governs the daily cap (§3.3).
 
 ---
 
@@ -253,8 +265,16 @@ Pre-flight estimation was investigated and found **unreliable for roughly
    resolution-qualified SKUs at `0.112` with **no audio variants**, alongside
    `duration_seconds_with_audio` at `0.168`. Image-to-video at 720p with audio
    has no correct key; most-specific-match drops a **50%** surcharge.
-4. **Missing axes.** `alibaba/wan-2.7` and `kwaivgi/kling-video-o1` are
-   audio-capable but carry only a bare `duration_seconds` SKU.
+4. **Missing axes — measured at 2.5× under.** `alibaba/wan-2.7` and
+   `kwaivgi/kling-video-o1` are audio-capable but carry only a bare
+   `duration_seconds` SKU. This was confirmed against a real charge on
+   2026-07-20: `wan-2.7` advertises `generate_audio: true` with
+   `pricing_skus = {"duration_seconds": "0.1"}` and nothing else. A 2-second
+   generation therefore estimates **$0.20** and was billed **$0.50** — an
+   effective $0.25/s. The surcharge is not merely mis-keyed, it is **absent
+   from the SKU table entirely**, so no resolver reading that table can
+   recover it. This single observation is the strongest evidence in this
+   document that a spend cap must not rest on estimation.
 5. **Documented SKU grammar does not match reality.** The guide's example uses
    hyphenated keys (`per-video-second`); **no live model uses that form.**
 6. **A second pricing surface reports zero.**
@@ -787,12 +807,27 @@ causing duplicate downloads and double-counted spend. The reservation lock
 
 ## 12. Open items
 
-1. **Verify whether video `frame_images` accepts base64 data URIs** (§2.8).
-   Determines whether image-to-video is available on a private-network
-   deployment. Resolve with one cheap live generation before §6.1's video
-   reference slots are built.
+1. ~~**Verify whether video `frame_images` accepts base64 data URIs**~~ —
+   **RESOLVED 2026-07-20. They do.** Image-to-video works on a private network
+   with no tunnel. See §2.8 for the evidence and for the 240×240 minimum
+   discovered alongside it.
 2. **Confirm the OpenRouter per-key credit-limit workflow** and document the
    operator setup steps. Layer 1 (§3.2) is the authoritative guard, and its
-   configuration procedure is currently unverified.
-3. **Measure result-URL retention empirically** on the first successful video
-   job and record the observed window (§2.5).
+   configuration procedure is currently unverified. Partially observed: a key
+   provisioned with a $1 limit reports `limit: 1` and `limit_remaining` through
+   `GET /api/v1/key`, but the 402-on-exhaustion path has not been exercised,
+   and the endpoint is eventually consistent (§2.8).
+3. **Measure result-URL retention empirically** (§2.5). Still open. The first
+   successful generation completed in ~70s and was downloaded promptly, which
+   is the intended behaviour but leaves the retention window unmeasured. It
+   needs a deliberate delayed-download probe rather than a normal run.
+
+### Resolved findings worth keeping
+
+| Finding | Evidence |
+|---|---|
+| Video providers accept data URIs | `wan-2.7` completed with a 256×256 data-URI first frame |
+| Reference images need ≥ 240×240 | 8×8 rejected: *"must be at least 240x240, got 8x8"* |
+| Failed generations are not charged | The 8×8 rejection cost $0.00 |
+| Estimation can under-count by 2.5× | `wan-2.7` 2s: estimated $0.20, billed $0.50 (§3.1) |
+| `GET /api/v1/key` lags behind billing | `usage: 0` immediately after a $0.50 charge |
