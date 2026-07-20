@@ -106,6 +106,32 @@ async def test_finalise_success_writes_media_sidecar_and_asset(harness):
     assert AssetKind.THUMBNAIL in kinds
 
 
+async def test_the_sidecar_byte_count_matches_the_file_after_embedding(harness):
+    """The sidecar is what `rescan` rebuilds the database from (spec 5.3).
+
+    Embedding parameters rewrites the media file and changes its length, so a
+    sidecar written before that step records a stale size. Left uncorrected, a
+    restore would populate every asset row with the pre-embed byte count.
+    """
+    import json
+
+    row = await harness.image_runner.create_pending(harness.image_request())
+    reservation = await _reserve(harness, row.id)
+
+    outcome = await harness.image_runner.finalise_success(
+        gen_id=row.id,
+        data=PNG_BYTES,
+        media_type="image/png",
+        cost=Decimal("0.04"),
+        reservation=reservation,
+    )
+
+    media_path = harness.paths.root / outcome.file_path
+    sidecar = json.loads(harness.paths.sidecar_path(media_path).read_text())
+
+    assert sidecar["media"]["bytes"] == media_path.stat().st_size
+
+
 async def test_finalise_success_marks_the_row_complete_and_releases_the_reservation(
     harness,
 ):

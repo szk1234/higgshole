@@ -71,24 +71,26 @@ async def test_list_image_models_parses_reference_limits(client):
 
 @respx.mock
 async def test_image_pricing_is_fetched_per_model(client):
+    # The live shape: "endpoints" sits at the top level with no "data"
+    # envelope, unlike the catalogue listings. Assuming the envelope made this
+    # return [] for every model, silently disabling image cost estimation.
     respx.get(f"{BASE_URL}/images/models/openai/gpt-image-2/endpoints").mock(
         return_value=httpx.Response(
             200,
             json={
-                "data": {
-                    "endpoints": [
-                        {
-                            "provider_name": "OpenAI",
-                            "pricing": [
-                                {
-                                    "billable": "output_image",
-                                    "unit": "token",
-                                    "cost_usd": 3e-05,
-                                }
-                            ],
-                        }
-                    ]
-                }
+                "id": "openai/gpt-image-2",
+                "endpoints": [
+                    {
+                        "provider_name": "OpenAI",
+                        "pricing": [
+                            {
+                                "billable": "output_image",
+                                "unit": "token",
+                                "cost_usd": 3e-05,
+                            }
+                        ],
+                    }
+                ],
             },
         )
     )
@@ -96,6 +98,37 @@ async def test_image_pricing_is_fetched_per_model(client):
     pricing = await client.get_image_model_pricing("openai/gpt-image-2")
 
     assert pricing[0]["unit"] == "token"
+
+
+@respx.mock
+async def test_image_pricing_also_accepts_a_data_envelope(client):
+    """Defensive: the listing endpoints do wrap in "data", so tolerate both."""
+    respx.get(f"{BASE_URL}/images/models/a/b/endpoints").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "endpoints": [
+                        {"pricing": [{"billable": "output_image", "unit": "image",
+                                      "cost_usd": 0.04}]}
+                    ]
+                }
+            },
+        )
+    )
+
+    pricing = await client.get_image_model_pricing("a/b")
+
+    assert pricing[0]["cost_usd"] == 0.04
+
+
+@respx.mock
+async def test_image_pricing_is_empty_when_a_model_has_no_endpoints(client):
+    respx.get(f"{BASE_URL}/images/models/a/b/endpoints").mock(
+        return_value=httpx.Response(200, json={"id": "a/b", "endpoints": []})
+    )
+
+    assert await client.get_image_model_pricing("a/b") == []
 
 
 @respx.mock

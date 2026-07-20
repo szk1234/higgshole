@@ -149,8 +149,18 @@ class OpenRouterClient:
         request per model, which is why the caller caches it (spec section 4.2).
         """
         payload = await self._get_json(f"/images/models/{model_id}/endpoints")
-        data = payload.get("data") if isinstance(payload, dict) else None
-        endpoints = (data or {}).get("endpoints") or []
+        if not isinstance(payload, dict):
+            return []
+
+        # The live endpoint returns {"id": ..., "endpoints": [...]} with no
+        # envelope, unlike the catalogue listings which wrap their payload in
+        # "data". Accept both: assuming the wrapper silently yielded [] for
+        # every model, which disabled image cost estimation entirely.
+        body = payload.get("data")
+        if not isinstance(body, dict):
+            body = payload
+
+        endpoints = body.get("endpoints") or []
         if not endpoints:
             return []
         return list(endpoints[0].get("pricing") or [])

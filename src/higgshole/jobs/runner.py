@@ -627,6 +627,16 @@ class JobRunner:
             logger.warning(
                 "embedding parameters failed for %s", gen_id, exc_info=True
             )
+        else:
+            # Embedding rewrites the file and changes its length, so the
+            # sidecar's byte count is now stale. Correct it: the sidecar is
+            # what `rescan` rebuilds the database from, and a wrong size there
+            # becomes a wrong size everywhere after a restore. Only on success
+            # — a failed embed leaves the file, and the original count, intact.
+            embedded_size = file_size(allocated.media_path)
+            if embedded_size != payload["media"]["bytes"]:
+                payload["media"]["bytes"] = embedded_size
+                write_sidecar(allocated.sidecar_path, payload)
 
         asset = self.db.create_asset(
             kind=AssetKind.OUTPUT,
