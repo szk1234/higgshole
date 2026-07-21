@@ -38,3 +38,7 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+# browser test artifacts
+.playwright-mcp/
+*-page.png

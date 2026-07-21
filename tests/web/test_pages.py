@@ -132,3 +132,49 @@ def test_the_vendored_stylesheet_is_served(pages):
 
     assert response.status_code == 200
     assert "text/css" in response.headers["content-type"]
+
+
+def test_the_form_wiring_script_is_loaded_on_every_page(pages):
+    """The two primary forms submit JSON via app.js. Without it the browser
+    falls back to a GET that leaks the API key into the URL and never reaches
+    the API — the failure this test exists to prevent regressing.
+    """
+    client, _ = pages
+
+    for path in ("/", "/settings"):
+        assert '/static/app.js' in client.get(path).text
+
+
+def test_the_form_wiring_script_targets_the_real_forms_and_endpoints(pages):
+    """Lock the contract between the templates and app.js. If a form id or an
+    endpoint path changes on one side but not the other, submission silently
+    breaks in the browser while every TestClient test still passes.
+    """
+    client, _ = pages
+
+    script = client.get("/static/app.js").text
+
+    # The ids app.js binds to must exist in the rendered forms.
+    assert 'id="settings-form"' in client.get("/settings").text
+    assert 'id="create-form"' in client.get("/").text
+
+    # The endpoints app.js calls must be the real ones.
+    for endpoint in (
+        '/api/settings',
+        '/api/settings/catalog/refresh',
+        '/api/generate/',
+    ):
+        assert endpoint in script
+
+
+def test_the_settings_form_does_not_submit_as_a_get(pages):
+    """A bare <form> with a submit button GETs its own URL, putting the API key
+    in the query string. The form must have no GET action; app.js drives it.
+    """
+    client, _ = pages
+
+    settings_html = client.get("/settings").text
+    form = settings_html[settings_html.index('id="settings-form"'):]
+    form = form[: form.index("</form>")]
+    assert 'method="get"' not in form.lower()
+    assert 'action=' not in form.lower()
